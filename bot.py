@@ -149,6 +149,66 @@ async def roll_slash(interaction: discord.Interaction, expression: str):
             text = text[chunk:]
         await interaction.channel.send(result_part)
 
+# ---- mission sending -------------------------------------------------------
+from pathlib import Path
+
+MEDIA_DIR = Path(__file__).parent / "media"
+# If you want a whitelist, map ids to base names here:
+# MISSIONS = {"001": "mission001.mp4", "002": "mission002.mp4"}
+# For now we auto-discover by id (mission###.*)
+
+def _normalize_id(raw: str) -> str:
+    # accept "1", "01", "001" -> "001"; only digits, max 4 just to be safe
+    digits = "".join(ch for ch in raw if ch.isdigit())[:4]
+    if not digits:
+        raise ValueError("ID inválido. Usa `!mission 001` por exemplo.")
+    return digits.zfill(3)
+
+def _find_mission_file(mission_id: str) -> Path:
+    # look for missionXXX with any extension
+    pattern = f"mission{mission_id}."
+    candidates = [p for p in MEDIA_DIR.iterdir() if p.name.startswith(pattern)]
+    if not candidates:
+        raise FileNotFoundError(f"Missão {mission_id} não encontrada em `{MEDIA_DIR}`.")
+    # prefer mp4 if multiple
+    candidates.sort(key=lambda p: (p.suffix != ".mp4", p.name))
+    return candidates[0]
+
+@bot.command(name="mission")
+async def mission_cmd(ctx, mission_id: str):
+    """Ex.: !mission 001  -> envia media/mission001.mp4 (ou o que existir)"""
+    try:
+        mid = _normalize_id(mission_id)
+        path = _find_mission_file(mid)
+    except Exception as e:
+        await ctx.send(str(e))
+        return
+
+    # Discord size limits apply. This will fail if the file is too large.
+    try:
+        await ctx.send(file=discord.File(fp=path, filename=path.name))
+    except discord.HTTPException as e:
+        await ctx.send(f"Falha ao enviar `{path.name}` ({e}). "
+                       f"Arquivo pode ser grande demais. Considera enviar um link/CDN.")
+
+# Slash version
+@bot.tree.command(name="mission", description="Enviar a missão (ex.: 001)")
+async def mission_slash(interaction: discord.Interaction, mission_id: str):
+    try:
+        mid = _normalize_id(mission_id)
+        path = _find_mission_file(mid)
+    except Exception as e:
+        await interaction.response.send_message(str(e), ephemeral=True)
+        return
+
+    # respond + attach
+    await interaction.response.send_message(f"Missão {mid}:")
+    try:
+        await interaction.followup.send(file=discord.File(fp=path, filename=path.name))
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Falha ao enviar `{path.name}` ({e}). "
+                                        f"Arquivo pode ser grande demais.")
+
 # ---- graceful shutdown -----------------------------------------------------
 def _shutdown(*_):
     logging.info("Shutting down...")
