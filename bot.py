@@ -4,7 +4,9 @@ import re
 import random
 import signal
 import logging
-
+import asyncio
+import aiohttp
+from aiohttp import web
 import discord
 from discord.ext import commands
 
@@ -19,6 +21,7 @@ logging.basicConfig(level=logging.INFO)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+ready_event = asyncio.Event()
 
 @bot.event
 async def on_ready():
@@ -28,6 +31,15 @@ async def on_ready():
         logging.info("Slash commands synced: %d", len(synced))
     except Exception as e:
         logging.exception("Slash sync failed: %s", e)
+    # mark bot ready and ensure webhook server is running
+    if not ready_event.is_set():
+        ready_event.set()
+    if not getattr(bot, "_web_started", False):
+        try:
+            await _ensure_webhook_server()
+            bot._web_started = True
+        except Exception:
+            logging.exception("Failed to start webhook server")
 
 # ---- roll core -------------------------------------------------------------
 ROLL_RE = re.compile(
@@ -85,6 +97,84 @@ def parse_and_roll(expr: str):
     # Final message
     msg = f"{spec_block} Rolagem: {rolls_block} Resultado: {total}"
     return msg
+
+# ---- webhook HTTP server ----------------------------------------------------
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
+
+async def _handle_roll(request: web.Request) -> web.StreamResponse:
+    if request.method != "POST":
+        return web.json_response({"error": "method not allowed"}, status=405)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    token = str(data.get("token", ""))
+    if WEBHOOK_TOKEN and token != WEBHOOK_TOKEN:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    channel_id = data.get("channel_id")
+    expression = data.get("expression")
+    if not channel_id or not expression:
+        return web.json_response({"error": "channel_id and expression are required"}, status=400)
+
+    try:
+        cid = int(channel_id)
+    except (TypeError, ValueError):
+        return web.json_response({"error": "channel_id must be an integer"}, status=400)
+
+    # wait for bot readiness
+    await ready_event.wait()
+
+    # resolve channel (cache or fetch)
+    channel = bot.get_channel(cid)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(cid)
+        except Exception:
+            logging.exception("Failed to fetch channel %s", cid)
+            return web.json_response({"error": "channel not found or inaccessible"}, status=404)
+
+    # build message using existing roller
+    try:
+        msg = parse_and_roll(str(expression))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+    # send, with same size-guard behavior as commands
+    try:
+        if len(msg) <= 1900:
+            await channel.send(msg)
+        else:
+            header = msg.split(" Rolagem: ")[0]
+            await channel.send(header)
+            left = msg[len(header) + 1:]
+            try:
+                rolls_part = left.split(" Resultado: ")[0].replace("Rolagem: ", "")
+                result_part = "Resultado: " + left.split(" Resultado: ")[1]
+            except Exception:
+                rolls_part, result_part = "", msg
+            chunk = 1700
+            text = rolls_part
+            while text:
+                await channel.send(text[:chunk])
+                text = text[chunk:]
+            await channel.send(result_part)
+    except discord.HTTPException as e:
+        logging.exception("Discord send failed")
+        return web.json_response({"error": f"discord error: {e}"}, status=502)
+
+    return web.json_response({"ok": True})
+
+async def _ensure_webhook_server():
+    app = web.Application()
+    app.add_routes([web.post("/webhook/roll", _handle_roll)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logging.info("🌐 Webhook server running on 0.0.0.0:%s", port)
 
 # ---- prefix command --------------------------------------------------------
 @bot.command(name="roll")
