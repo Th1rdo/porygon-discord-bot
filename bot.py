@@ -473,12 +473,43 @@ def _stop_countdown(guild_id: int) -> bool:
         return True
     return False
 
+COUNTDOWN_HELP = (
+    "⏳ **Countdown** — temporizador ao segundo (um por servidor)\n"
+    "\n"
+    "**Iniciar:**\n"
+    "`!countdown <tempo> [legenda]`\n"
+    "Exemplos:\n"
+    "• `!countdown 90` — 90 segundos\n"
+    "• `!countdown 5m` — 5 minutos\n"
+    "• `!countdown 1h30m Início do evento` — com legenda\n"
+    "• `!countdown 10:00` — formato mm:ss (também aceita hh:mm:ss)\n"
+    "\n"
+    "**Parar:** `!countdown stop`\n"
+    "\n"
+    "Formatos de tempo: `90`, `90s`, `5m`, `1h30m`, `mm:ss`, `hh:mm:ss` (máx. 24h).\n"
+    "Iniciar um novo countdown substitui o que estiver a correr."
+)
+
 @bot.command(name="countdown")
-async def countdown_cmd(ctx, duration: str, *, label: str | None = None):
-    """Ex.: !countdown 5m  ou  !countdown 1h30m Início do evento"""
+async def countdown_cmd(ctx, duration: str | None = None, *, label: str | None = None):
+    """!countdown -> ajuda | !countdown stop -> parar | !countdown 5m [legenda] -> iniciar"""
     if ctx.guild is None:
         await ctx.send("Os countdowns só funcionam num servidor.")
         return
+
+    # no args -> handout
+    if duration is None:
+        await ctx.send(COUNTDOWN_HELP)
+        return
+
+    # "!countdown stop" -> stop active one
+    if duration.lower() == "stop":
+        if _stop_countdown(ctx.guild.id):
+            await ctx.send("🛑 Countdown parado.")
+        else:
+            await ctx.send("Não há nenhum countdown ativo.")
+        return
+
     try:
         total = parse_duration(duration)
     except ValueError as e:
