@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 state.json
+# bot runtime config (volume / local fallback)
+guild_config.json
+guild_config.json.tmp

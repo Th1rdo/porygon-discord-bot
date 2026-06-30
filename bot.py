@@ -43,6 +43,62 @@ async def on_ready():
         except Exception:
             logging.exception("Failed to start webhook server")
 
+# ---- per-guild config ------------------------------------------------------
+import json
+from pathlib import Path as _Path
+
+# Toggleable features. A feature is ON unless a guild explicitly turns it off.
+FEATURES = ("roll", "mission", "countdown")
+
+# Config is stored as JSON on a persistent path. On Railway, mount a volume and
+# point DATA_DIR at it (e.g. /data) so settings survive redeploys/restarts.
+# If that path isn't writable (local dev, or volume not yet set up), fall back
+# to the project folder so the bot still works.
+def _resolve_data_dir() -> _Path:
+    candidate = _Path(os.getenv("DATA_DIR", "/data"))
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        if os.access(candidate, os.W_OK):
+            return candidate
+    except OSError:
+        pass
+    logging.warning("DATA_DIR %s not writable; config will NOT persist across redeploys", candidate)
+    return _Path(__file__).parent
+
+CONFIG_PATH = _resolve_data_dir() / "guild_config.json"
+
+def _load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("guilds"), dict):
+                return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {"guilds": {}}
+
+_config = _load_config()
+
+def _save_config() -> None:
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_config, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+    except OSError:
+        logging.exception("Failed to save guild config to %s", CONFIG_PATH)
+
+def feature_enabled(guild_id: int | None, feature: str) -> bool:
+    # No guild (DMs) -> always on; prefix collisions only happen in servers.
+    if guild_id is None:
+        return True
+    return _config["guilds"].get(str(guild_id), {}).get(feature, True)
+
+def set_feature(guild_id: int, feature: str, enabled: bool) -> None:
+    guilds = _config["guilds"]
+    guilds.setdefault(str(guild_id), {})[feature] = enabled
+    _save_config()
+
 # ---- roll core -------------------------------------------------------------
 ROLL_RE = re.compile(
     r"""
@@ -243,6 +299,9 @@ async def _ensure_webhook_server():
 # ---- prefix command --------------------------------------------------------
 @bot.command(name="roll")
 async def roll_cmd(ctx, *, expression: str):
+    # silently ignore if disabled here, so a different bot with the same prefix can answer
+    if not feature_enabled(ctx.guild.id if ctx.guild else None, "roll"):
+        return
     try:
         msg = parse_and_roll(expression)
     except ValueError as e:
@@ -278,6 +337,9 @@ async def roll_cmd(ctx, *, expression: str):
 # ---- slash command mirror --------------------------------------------------
 @bot.tree.command(name="roll", description="Rolar dados. Ex: 6d6 + 2 ou 3d20")
 async def roll_slash(interaction: discord.Interaction, expression: str):
+    if not feature_enabled(interaction.guild_id, "roll"):
+        await interaction.response.send_message("Esta função está desativada neste servidor.", ephemeral=True)
+        return
     try:
         msg = parse_and_roll(expression)
     except ValueError as e:
@@ -331,6 +393,8 @@ def _find_mission_file(mission_id: str) -> Path:
 @bot.command(name="mission")
 async def mission_cmd(ctx, mission_id: str):
     """Ex.: !mission 001  -> envia media/mission001.mp4 (ou o que existir)"""
+    if not feature_enabled(ctx.guild.id if ctx.guild else None, "mission"):
+        return
     try:
         mid = _normalize_id(mission_id)
         path = _find_mission_file(mid)
@@ -348,6 +412,9 @@ async def mission_cmd(ctx, mission_id: str):
 # Slash version
 @bot.tree.command(name="mission", description="Enviar a missão (ex.: 001)")
 async def mission_slash(interaction: discord.Interaction, mission_id: str):
+    if not feature_enabled(interaction.guild_id, "mission"):
+        await interaction.response.send_message("Esta função está desativada neste servidor.", ephemeral=True)
+        return
     try:
         mid = _normalize_id(mission_id)
         path = _find_mission_file(mid)
@@ -496,6 +563,8 @@ async def countdown_cmd(ctx, duration: str | None = None, *, label: str | None =
     if ctx.guild is None:
         await ctx.send("Os countdowns só funcionam num servidor.")
         return
+    if not feature_enabled(ctx.guild.id, "countdown"):
+        return
 
     # no args -> handout
     if duration is None:
@@ -532,6 +601,9 @@ async def countdown_slash(interaction: discord.Interaction, duration: str, label
     if interaction.guild_id is None:
         await interaction.response.send_message("Os countdowns só funcionam num servidor.", ephemeral=True)
         return
+    if not feature_enabled(interaction.guild_id, "countdown"):
+        await interaction.response.send_message("Esta função está desativada neste servidor.", ephemeral=True)
+        return
     try:
         total = parse_duration(duration)
     except ValueError as e:
@@ -551,6 +623,79 @@ async def countdown_stop_slash(interaction: discord.Interaction):
         await interaction.response.send_message("🛑 Countdown parado.", ephemeral=True)
     else:
         await interaction.response.send_message("Não há nenhum countdown ativo.", ephemeral=True)
+
+# ---- config command --------------------------------------------------------
+def _is_manager(member) -> bool:
+    perms = getattr(member, "guild_permissions", None)
+    return bool(perms and (perms.manage_guild or perms.administrator))
+
+def _render_config(guild_id: int) -> str:
+    lines = ["⚙️ **Config do Porygon neste servidor**", ""]
+    for feat in FEATURES:
+        estado = "✅ ativada" if feature_enabled(guild_id, feat) else "🚫 desativada"
+        lines.append(f"• `{feat}` — {estado}")
+    lines += [
+        "",
+        "**Como mudar** (só admins/gestores):",
+        "• `!config disable roll` — desligar uma função",
+        "• `!config enable roll` — voltar a ligar",
+        f"\nFunções: {', '.join(f'`{f}`' for f in FEATURES)}.",
+        "Quando uma função está desligada, o Porygon ignora-a por completo "
+        "(útil se tiveres outro bot com o mesmo prefixo `!`).",
+    ]
+    return "\n".join(lines)
+
+@bot.command(name="config")
+async def config_cmd(ctx, action: str | None = None, feature: str | None = None):
+    """!config -> ver | !config disable <função> | !config enable <função>"""
+    if ctx.guild is None:
+        await ctx.send("O `!config` só funciona dentro de um servidor.")
+        return
+    if not _is_manager(ctx.author):
+        await ctx.send("Só administradores/gestores do servidor (permissão *Manage Server*) podem usar o `!config`.")
+        return
+
+    if action is None:
+        await ctx.send(_render_config(ctx.guild.id))
+        return
+
+    action = action.lower()
+    if action not in ("enable", "disable"):
+        await ctx.send(_render_config(ctx.guild.id))
+        return
+
+    feat = (feature or "").lower()
+    if feat not in FEATURES:
+        await ctx.send(f"Função inválida. Opções: {', '.join(FEATURES)}.")
+        return
+
+    set_feature(ctx.guild.id, feat, action == "enable")
+    estado = "ativada ✅" if action == "enable" else "desativada 🚫"
+    await ctx.send(f"`{feat}` {estado} neste servidor.")
+
+@bot.tree.command(name="config", description="Ligar/desligar funções do Porygon neste servidor (só admins)")
+async def config_slash(interaction: discord.Interaction, action: str | None = None, feature: str | None = None):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("O config só funciona dentro de um servidor.", ephemeral=True)
+        return
+    if not _is_manager(interaction.user):
+        await interaction.response.send_message(
+            "Só administradores/gestores (permissão *Manage Server*) podem mudar a config.", ephemeral=True
+        )
+        return
+
+    if action is None or action.lower() not in ("enable", "disable"):
+        await interaction.response.send_message(_render_config(interaction.guild_id), ephemeral=True)
+        return
+
+    feat = (feature or "").lower()
+    if feat not in FEATURES:
+        await interaction.response.send_message(f"Função inválida. Opções: {', '.join(FEATURES)}.", ephemeral=True)
+        return
+
+    set_feature(interaction.guild_id, feat, action.lower() == "enable")
+    estado = "ativada ✅" if action.lower() == "enable" else "desativada 🚫"
+    await interaction.response.send_message(f"`{feat}` {estado} neste servidor.", ephemeral=True)
 
 # ---- graceful shutdown -----------------------------------------------------
 def _shutdown(*_):
