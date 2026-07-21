@@ -42,6 +42,10 @@ async def on_ready():
             bot._web_started = True
         except Exception:
             logging.exception("Failed to start webhook server")
+    if not getattr(bot, "_scheduler_started", False):
+        bot.loop.create_task(_session_scheduler_loop())
+        bot._scheduler_started = True
+        logging.info("🗓️ Session scheduler loop started")
 
 # ---- per-guild config ------------------------------------------------------
 import json
@@ -65,7 +69,8 @@ def _resolve_data_dir() -> _Path:
     logging.warning("DATA_DIR %s not writable; config will NOT persist across redeploys", candidate)
     return _Path(__file__).parent
 
-CONFIG_PATH = _resolve_data_dir() / "guild_config.json"
+DATA_DIR_PATH = _resolve_data_dir()
+CONFIG_PATH = DATA_DIR_PATH / "guild_config.json"
 
 def _load_config() -> dict:
     try:
@@ -696,6 +701,440 @@ async def config_slash(interaction: discord.Interaction, action: str | None = No
     set_feature(interaction.guild_id, feat, action.lower() == "enable")
     estado = "ativada ✅" if action.lower() == "enable" else "desativada 🚫"
     await interaction.response.send_message(f"`{feat}` {estado} neste servidor.", ephemeral=True)
+
+# ---- session scheduler -----------------------------------------------------
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+DEFAULT_TZ = "Europe/Lisbon"
+SESSIONS_PATH = DATA_DIR_PATH / "sessions.json"
+
+YES_EMOJI = "✅"
+NO_EMOJI = "❌"
+
+def _load_sessions() -> dict:
+    try:
+        with open(SESSIONS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("guilds"), dict):
+                return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {"guilds": {}}
+
+_sessions = _load_sessions()
+
+def _save_sessions() -> None:
+    tmp = SESSIONS_PATH.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_sessions, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SESSIONS_PATH)
+    except OSError:
+        logging.exception("Failed to save sessions to %s", SESSIONS_PATH)
+
+def _guild_state(guild_id: int) -> dict:
+    g = _sessions["guilds"].setdefault(str(guild_id), {})
+    s = g.setdefault("settings", {})
+    s.setdefault("timezone", DEFAULT_TZ)
+    s.setdefault("role_id", None)
+    s.setdefault("announce_channel_id", None)
+    s.setdefault("remind_hours_before", 24)
+    s.setdefault("players", {})  # {uid: {"name": str, "channel_id": int|None}}
+    g.setdefault("active", None)
+    return g
+
+def _parse_when(text: str, tzname: str) -> int:
+    """Accepts a Unix timestamp, a pasted <t:...:F>, or 'YYYY-MM-DD HH:MM' in the guild tz."""
+    text = text.strip()
+    if text.isdigit() and len(text) >= 9:
+        return int(text)
+    m = re.match(r"^<t:(\d+)(?::[a-zA-Z])?>$", text)
+    if m:
+        return int(m.group(1))
+    tz = ZoneInfo(tzname)
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M"):
+        try:
+            dt = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return int(dt.replace(tzinfo=tz).timestamp())
+    raise ValueError(
+        "Data inválida. Usa `AAAA-MM-DD HH:MM` (ex.: `2026-08-15 21:00`), "
+        "um timestamp Unix, ou cola um `<t:...:F>`."
+    )
+
+def _announce_message(state_settings: dict, sess: dict) -> str:
+    role_id = state_settings.get("role_id")
+    ping = f"\n<@&{role_id}>" if role_id else ""
+    title = sess["title"]
+    header = f'## "{title}"'
+    if sess.get("chapter"):
+        header += f" - {sess['chapter']}"
+    lines = [header]
+    if sess.get("subtitle"):
+        lines.append(f"> ***{sess['subtitle']}***")
+    lines.append(f"> ### <t:{sess['when']}:F>")
+    lines.append(f"> <t:{sess['when']}:R>")
+    return "\n".join(lines) + ping
+
+def _confirm_message(state_settings: dict, sess: dict) -> str:
+    role_id = state_settings.get("role_id")
+    ping = f"<@&{role_id}>\n" if role_id else ""
+    return (
+        f"{ping}"
+        f'Pessoal, **próxima sessão** de **"{sess["title"]}"** proposta para '
+        f"<t:{sess['when']}:F> (<t:{sess['when']}:R>).\n\n"
+        f"Respondam com {YES_EMOJI} se **conseguem comprometer-se** com a data, "
+        f"ou {NO_EMOJI} se **não** conseguem, até <t:{sess['deadline']}:F> "
+        f"(<t:{sess['deadline']}:R>). Não vou contar silêncio como confirmação. "
+        f"Quem **não puder**, avise no seu chat pessoal.\n\n"
+        f"Imprevistos reais acontecem, mas **evitem marcar** outros planos por cima "
+        f"**depois** de confirmar a data."
+    )
+
+def _jump_link(guild_id: int, channel_id: int, message_id: int) -> str:
+    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+async def _resolve_channel(channel_id: int):
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(channel_id)
+        except Exception:
+            logging.exception("Failed to fetch channel %s", channel_id)
+            return None
+    return ch
+
+async def _gather_confirmations(guild_id: int, sess: dict):
+    """Returns (confirmed_ids, declined_ids, no_response_ids) based on reactions vs registered players."""
+    yes, no = set(), set()
+    channel = await _resolve_channel(sess["channel_id"])
+    if channel is not None:
+        try:
+            msg = await channel.fetch_message(sess["message_id"])
+            for reaction in msg.reactions:
+                if str(reaction.emoji) == YES_EMOJI:
+                    async for u in reaction.users():
+                        if not u.bot:
+                            yes.add(u.id)
+                elif str(reaction.emoji) == NO_EMOJI:
+                    async for u in reaction.users():
+                        if not u.bot:
+                            no.add(u.id)
+        except Exception:
+            logging.exception("Failed to read reactions for session in guild %s", guild_id)
+    players = {int(uid) for uid in _guild_state(guild_id)["settings"]["players"]}
+    # a ✅ wins over ❌ if someone reacted both
+    confirmed = yes
+    declined = no - yes
+    no_response = players - yes - no
+    return confirmed, declined, no_response
+
+def _mentions(ids) -> str:
+    return " ".join(f"<@{i}>" for i in ids) if ids else "—"
+
+async def _create_session(interaction: discord.Interaction, *, style: str, title: str,
+                          when: int, chapter: str | None, subtitle: str | None,
+                          deadline: int | None):
+    guild_id = interaction.guild_id
+    g = _guild_state(guild_id)
+    settings = g["settings"]
+
+    channel = interaction.channel
+    sess = {
+        "title": title,
+        "chapter": chapter,
+        "subtitle": subtitle,
+        "when": when,
+        "deadline": deadline if deadline is not None else max(int(when - 2 * 86400), 0),
+        "channel_id": channel.id,
+        "message_id": None,
+        "style": style,
+        "sent": {"deadline": False, "before": False, "start": False, "post": False},
+    }
+    # confirm-style sessions track a deadline; announce-style ones are already decided
+    if style == "announce":
+        sess["sent"]["deadline"] = True
+        content = _announce_message(settings, sess)
+    else:
+        content = _confirm_message(settings, sess)
+
+    message = await channel.send(content)
+    try:
+        await message.add_reaction(YES_EMOJI)
+        await message.add_reaction(NO_EMOJI)
+    except discord.HTTPException:
+        pass
+    sess["message_id"] = message.id
+    g["active"] = sess
+    _save_sessions()
+    return sess
+
+# ---- reminder loop ----------------------------------------------------------
+async def _do_deadline(guild_id: int, sess: dict):
+    settings = _guild_state(guild_id)["settings"]
+    confirmed, declined, no_response = await _gather_confirmations(guild_id, sess)
+    channel = await _resolve_channel(sess["channel_id"])
+    jump = _jump_link(guild_id, sess["channel_id"], sess["message_id"])
+    if channel is not None:
+        await channel.send(
+            f"⏰ **Prazo de confirmação terminou** — sessão de **{sess['title']}** "
+            f"em <t:{sess['when']}:F>.\n"
+            f"{YES_EMOJI} Confirmados ({len(confirmed)}): {_mentions(confirmed)}\n"
+            f"{NO_EMOJI} Não podem ({len(declined)}): {_mentions(declined)}\n"
+            f"❓ Sem resposta ({len(no_response)}): {_mentions(no_response)}"
+        )
+    # nudge non-responders in their personal channels
+    players = settings["players"]
+    for uid in no_response:
+        cid = players.get(str(uid), {}).get("channel_id")
+        if not cid:
+            continue
+        pch = await _resolve_channel(cid)
+        if pch is None:
+            continue
+        try:
+            await pch.send(
+                f"Ei <@{uid}>! Ainda não confirmaste a sessão de **{sess['title']}** "
+                f"em <t:{sess['when']}:F> (<t:{sess['when']}:R>).\n"
+                f"Reage {YES_EMOJI} ou {NO_EMOJI} aqui: {jump}"
+            )
+        except discord.HTTPException:
+            logging.exception("Failed to nudge player %s", uid)
+
+async def _do_before(guild_id: int, sess: dict):
+    settings = _guild_state(guild_id)["settings"]
+    channel = await _resolve_channel(sess["channel_id"])
+    if channel is None:
+        return
+    confirmed, _declined, no_response = await _gather_confirmations(guild_id, sess)
+    ping = f"<@&{settings['role_id']}>" if settings.get("role_id") else _mentions(confirmed)
+    extra = ""
+    if no_response:
+        extra = f"\nAinda sem resposta: {_mentions(no_response)} — deem sinal! 🙏"
+    await channel.send(
+        f"⏳ **Falta pouco!** Sessão de **{sess['title']}** <t:{sess['when']}:R> "
+        f"— <t:{sess['when']}:F>.\n"
+        f"Confirmados ({len(confirmed)}): {_mentions(confirmed)}{extra}\n{ping}"
+    )
+
+async def _do_start(guild_id: int, sess: dict):
+    settings = _guild_state(guild_id)["settings"]
+    channel = await _resolve_channel(sess["channel_id"])
+    if channel is None:
+        return
+    confirmed, _d, _n = await _gather_confirmations(guild_id, sess)
+    ping = f"<@&{settings['role_id']}>" if settings.get("role_id") else _mentions(confirmed)
+    await channel.send(
+        f"🎲 **É HOJE!** A sessão de **{sess['title']}** começa <t:{sess['when']}:R>. "
+        f"Preparem-se! {ping}"
+    )
+
+async def _do_post(guild_id: int, sess: dict):
+    channel = await _resolve_channel(sess["channel_id"])
+    if channel is not None:
+        await channel.send(
+            f"📖 A sessão de **{sess['title']}** terminou (ou já passou). "
+            f"Obrigado a quem apareceu! Bora marcar a próxima? 🔥"
+        )
+    # clear active session so a new one can be scheduled
+    _guild_state(guild_id)["active"] = None
+    _save_sessions()
+
+async def _tick_sessions():
+    now = time.time()
+    for gid_str in list(_sessions["guilds"].keys()):
+        g = _sessions["guilds"][gid_str]
+        sess = g.get("active")
+        if not sess:
+            continue
+        gid = int(gid_str)
+        sent = sess["sent"]
+        when = sess["when"]
+        remind_s = _guild_state(gid)["settings"].get("remind_hours_before", 24) * 3600
+        changed = False
+        try:
+            if not sent.get("deadline") and now >= sess["deadline"] and now < when:
+                await _do_deadline(gid, sess); sent["deadline"] = True; changed = True
+            if not sent.get("before") and (when - remind_s) <= now < when:
+                await _do_before(gid, sess); sent["before"] = True; changed = True
+            if not sent.get("start") and when <= now < when + 3 * 3600:
+                await _do_start(gid, sess); sent["start"] = True; changed = True
+            if not sent.get("post") and now >= when + 3 * 3600:
+                await _do_post(gid, sess); sent["post"] = True; changed = True
+        except Exception:
+            logging.exception("Reminder action failed for guild %s", gid)
+        if changed:
+            _save_sessions()
+
+async def _session_scheduler_loop():
+    await ready_event.wait()
+    while True:
+        try:
+            await _tick_sessions()
+        except Exception:
+            logging.exception("session scheduler tick failed")
+        await asyncio.sleep(30)
+
+# ---- session commands (GM / admins only) -----------------------------------
+async def _require_manager_slash(interaction: discord.Interaction) -> bool:
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Só funciona dentro de um servidor.", ephemeral=True)
+        return False
+    if not _is_manager(interaction.user):
+        await interaction.response.send_message(
+            "Só administradores/gestores (permissão *Manage Server*) podem gerir sessões.", ephemeral=True
+        )
+        return False
+    return True
+
+@bot.tree.command(name="session_setup", description="Configurar o role a pingar, canal e fuso horário")
+async def session_setup(interaction: discord.Interaction,
+                        role: discord.Role | None = None,
+                        announce_channel: discord.TextChannel | None = None,
+                        timezone: str | None = None,
+                        remind_hours_before: int | None = None):
+    if not await _require_manager_slash(interaction):
+        return
+    settings = _guild_state(interaction.guild_id)["settings"]
+    if role is not None:
+        settings["role_id"] = role.id
+    if announce_channel is not None:
+        settings["announce_channel_id"] = announce_channel.id
+    if timezone is not None:
+        try:
+            ZoneInfo(timezone)
+        except Exception:
+            await interaction.response.send_message(
+                "Fuso horário inválido. Ex.: `Europe/Lisbon`.", ephemeral=True)
+            return
+        settings["timezone"] = timezone
+    if remind_hours_before is not None:
+        settings["remind_hours_before"] = max(1, remind_hours_before)
+    _save_sessions()
+    role_txt = f"<@&{settings['role_id']}>" if settings.get("role_id") else "—"
+    await interaction.response.send_message(
+        "⚙️ **Config de sessões**\n"
+        f"• Role: {role_txt}\n"
+        f"• Fuso: `{settings['timezone']}`\n"
+        f"• Lembrete: {settings['remind_hours_before']}h antes\n"
+        f"• Jogadores registados: {len(settings['players'])}",
+        ephemeral=True,
+    )
+
+@bot.tree.command(name="session_player", description="Registar/atualizar um jogador e o seu chat pessoal")
+async def session_player(interaction: discord.Interaction,
+                         player: discord.User,
+                         personal_channel: discord.TextChannel | None = None):
+    if not await _require_manager_slash(interaction):
+        return
+    settings = _guild_state(interaction.guild_id)["settings"]
+    settings["players"][str(player.id)] = {
+        "name": player.display_name,
+        "channel_id": personal_channel.id if personal_channel else None,
+    }
+    _save_sessions()
+    ch_txt = f"<#{personal_channel.id}>" if personal_channel else "sem chat pessoal"
+    await interaction.response.send_message(
+        f"✅ Jogador <@{player.id}> registado ({ch_txt}). "
+        f"Total: {len(settings['players'])}.", ephemeral=True)
+
+@bot.tree.command(name="session_player_remove", description="Remover um jogador da lista")
+async def session_player_remove(interaction: discord.Interaction, player: discord.User):
+    if not await _require_manager_slash(interaction):
+        return
+    settings = _guild_state(interaction.guild_id)["settings"]
+    if settings["players"].pop(str(player.id), None) is None:
+        await interaction.response.send_message("Esse jogador não estava registado.", ephemeral=True)
+        return
+    _save_sessions()
+    await interaction.response.send_message(
+        f"🗑️ <@{player.id}> removido. Total: {len(settings['players'])}.", ephemeral=True)
+
+@bot.tree.command(name="session_players", description="Ver os jogadores registados")
+async def session_players(interaction: discord.Interaction):
+    if not await _require_manager_slash(interaction):
+        return
+    players = _guild_state(interaction.guild_id)["settings"]["players"]
+    if not players:
+        await interaction.response.send_message(
+            "Nenhum jogador registado. Usa `/session_player`.", ephemeral=True)
+        return
+    lines = []
+    for uid, p in players.items():
+        ch = f"<#{p['channel_id']}>" if p.get("channel_id") else "⚠️ sem chat"
+        lines.append(f"• <@{uid}> — {ch}")
+    await interaction.response.send_message(
+        "👥 **Jogadores registados:**\n" + "\n".join(lines), ephemeral=True)
+
+@bot.tree.command(name="session_propose",
+                  description="Propor uma sessão e pedir confirmação (✅/❌) até um prazo")
+async def session_propose(interaction: discord.Interaction,
+                          title: str, when: str,
+                          chapter: str | None = None,
+                          subtitle: str | None = None,
+                          deadline: str | None = None):
+    if not await _require_manager_slash(interaction):
+        return
+    settings = _guild_state(interaction.guild_id)["settings"]
+    try:
+        when_ts = _parse_when(when, settings["timezone"])
+        deadline_ts = _parse_when(deadline, settings["timezone"]) if deadline else None
+    except ValueError as e:
+        await interaction.response.send_message(str(e), ephemeral=True)
+        return
+    await interaction.response.send_message("A publicar proposta de sessão… 📨", ephemeral=True)
+    await _create_session(interaction, style="propose", title=title, when=when_ts,
+                          chapter=chapter, subtitle=subtitle, deadline=deadline_ts)
+
+@bot.tree.command(name="session_announce",
+                  description="Anunciar uma sessão já marcada (mensagem de hype)")
+async def session_announce(interaction: discord.Interaction,
+                           title: str, when: str,
+                           chapter: str | None = None,
+                           subtitle: str | None = None):
+    if not await _require_manager_slash(interaction):
+        return
+    settings = _guild_state(interaction.guild_id)["settings"]
+    try:
+        when_ts = _parse_when(when, settings["timezone"])
+    except ValueError as e:
+        await interaction.response.send_message(str(e), ephemeral=True)
+        return
+    await interaction.response.send_message("A publicar anúncio de sessão… 🎲", ephemeral=True)
+    await _create_session(interaction, style="announce", title=title, when=when_ts,
+                          chapter=chapter, subtitle=subtitle, deadline=None)
+
+@bot.tree.command(name="session_status", description="Ver quem confirmou / não confirmou a sessão ativa")
+async def session_status(interaction: discord.Interaction):
+    if not await _require_manager_slash(interaction):
+        return
+    sess = _guild_state(interaction.guild_id).get("active")
+    if not sess:
+        await interaction.response.send_message("Não há sessão ativa.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    confirmed, declined, no_response = await _gather_confirmations(interaction.guild_id, sess)
+    await interaction.followup.send(
+        f"📊 **{sess['title']}** — <t:{sess['when']}:F>\n"
+        f"{YES_EMOJI} Confirmados ({len(confirmed)}): {_mentions(confirmed)}\n"
+        f"{NO_EMOJI} Não podem ({len(declined)}): {_mentions(declined)}\n"
+        f"❓ Sem resposta ({len(no_response)}): {_mentions(no_response)}",
+        ephemeral=True,
+    )
+
+@bot.tree.command(name="session_cancel", description="Cancelar/limpar a sessão ativa")
+async def session_cancel(interaction: discord.Interaction):
+    if not await _require_manager_slash(interaction):
+        return
+    g = _guild_state(interaction.guild_id)
+    if not g.get("active"):
+        await interaction.response.send_message("Não há sessão ativa.", ephemeral=True)
+        return
+    g["active"] = None
+    _save_sessions()
+    await interaction.response.send_message("🛑 Sessão cancelada.", ephemeral=True)
 
 # ---- graceful shutdown -----------------------------------------------------
 def _shutdown(*_):
