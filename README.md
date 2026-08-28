@@ -138,6 +138,15 @@ Liga/desliga funções por servidor — útil quando outro bot usa o mesmo prefi
 
 Com uma função desligada: o comando `!` fica **em silêncio total** (o outro bot pode responder); o comando `/` responde só a ti a dizer que está desativada.
 
+### 📨 Send Message (falar pelo bot)
+
+Só para admins/gestores. O bot envia a mensagem como se fosse ele a falar.
+
+| Comando | Descrição |
+|---|---|
+| `/send_message <canal> <mensagem>` | Envia a mensagem ao canal escolhido (escreve `\n` para quebras de linha) |
+| `!send_message <channel_id> <mensagem>` | Versão prefixo — aceita mensagens multilinha e `#canal` ou ID |
+
 ### 📬 Manual
 
 | Comando | Descrição |

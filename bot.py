@@ -1263,6 +1263,46 @@ async def session_cancel(interaction: discord.Interaction):
     _save_sessions()
     await interaction.response.send_message("🛑 Sessão cancelada.", ephemeral=True)
 
+# ---- send_message (falar pelo bot) -----------------------------------------
+@bot.tree.command(name="send_message", description="Enviar uma mensagem pelo bot para um canal (só admins)")
+async def send_message_slash(interaction: discord.Interaction,
+                             channel: discord.TextChannel,
+                             message: str):
+    if not await _require_manager_slash(interaction):
+        return
+    # slash inputs are single-line; allow literal \n for line breaks
+    content = message.replace("\\n", "\n")
+    try:
+        await channel.send(content)
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"Falha ao enviar: {e}", ephemeral=True)
+        return
+    await interaction.response.send_message(f"📨 Enviado para {channel.mention}.", ephemeral=True)
+
+@bot.command(name="send_message")
+async def send_message_cmd(ctx, channel_id: str, *, message: str):
+    """!send_message <channel_id> <mensagem> — suporta várias linhas."""
+    if ctx.guild is None or not _is_manager(ctx.author):
+        return
+    try:
+        cid = int(channel_id.strip("<#>"))
+    except ValueError:
+        await ctx.send("ID de canal inválido. Usa o ID numérico ou #canal.")
+        return
+    channel = await _resolve_channel(cid)
+    if channel is None:
+        await ctx.send("Canal não encontrado.")
+        return
+    try:
+        await channel.send(message)
+    except discord.HTTPException as e:
+        await ctx.send(f"Falha ao enviar: {e}")
+        return
+    try:
+        await ctx.message.add_reaction("📨")
+    except discord.HTTPException:
+        pass
+
 # ---- manual (README por DM) ------------------------------------------------
 README_PATH = Path(__file__).parent / "README.md"
 
