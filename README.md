@@ -150,12 +150,13 @@ O manual é lido do `README.md` em runtime — atualizar este ficheiro atualiza 
 
 Servidor aiohttp na porta `PORT` (default 8080) para disparar rolls de fora do Discord.
 
-| Endpoint | Body (JSON) |
-|---|---|
-| `POST /webhook/roll` | `{"token", "channel_id", "expression", "message"?}` |
-| `POST /webhook/rollmessage` | `{"token", "channel_id", "expression", "message"}` |
+| Endpoint | Body (JSON) | Descrição |
+|---|---|---|
+| `POST /webhook/roll` | `{"token", "channel_id", "expression", "message"?}` | Rola dados num canal |
+| `POST /webhook/rollmessage` | `{"token", "channel_id", "expression", "message"}` | Roll com cabeçalho |
+| `POST /webhook/broadcast` | `{"token", "channel_ids": [..], "content"}` | Envia a mesma mensagem a vários canais (máx. 10, conteúdo ≤2000 chars) — usado pelos botões do site |
 
-Se a env var `WEBHOOK_TOKEN` estiver definida, o `token` do body tem de bater certo. URL pública: `https://porygon-discord-bot-production.up.railway.app`.
+O `token` tem de bater com a env var `WEBHOOK_TOKEN` (ou `WEBHOOK_SECRET`); o `/broadcast` **recusa** pedidos se nenhuma estiver definida. As respostas têm CORS aberto para chamadas de browser. URL pública: `https://porygon-discord-bot-production.up.railway.app`.
 
 ---
 

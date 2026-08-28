@@ -162,7 +162,7 @@ def parse_and_roll(expr: str):
     return msg
 
 # ---- webhook HTTP server ----------------------------------------------------
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN") or os.getenv("WEBHOOK_SECRET")
 
 async def _handle_roll(request: web.Request) -> web.StreamResponse:
     if request.method != "POST":
@@ -288,11 +288,71 @@ async def _send_roll_to_channel(channel: discord.abc.Messageable, msg: str, head
         text = text[chunk:]
     await channel.send(result_part)
 
+async def _handle_broadcast(request: web.Request) -> web.StreamResponse:
+    """Send the same message to several channels. Body:
+    {"token": str, "channel_ids": [int, ...], "content": str}
+    Used by the website's buttons (e.g. temporal-reconstruction prompts)."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    token = str(data.get("token", ""))
+    if not WEBHOOK_TOKEN or token != WEBHOOK_TOKEN:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    channel_ids = data.get("channel_ids")
+    content = data.get("content")
+    if not isinstance(channel_ids, list) or not channel_ids or len(channel_ids) > 10:
+        return web.json_response({"error": "channel_ids must be a list of 1-10 ids"}, status=400)
+    if not isinstance(content, str) or not content.strip() or len(content) > 2000:
+        return web.json_response({"error": "content must be a string of 1-2000 chars"}, status=400)
+
+    try:
+        cids = [int(c) for c in channel_ids]
+    except (TypeError, ValueError):
+        return web.json_response({"error": "channel_ids must be integers"}, status=400)
+
+    await ready_event.wait()
+
+    results: dict[str, str] = {}
+    for cid in cids:
+        channel = await _resolve_channel(cid)
+        if channel is None:
+            results[str(cid)] = "error: channel not found"
+            continue
+        try:
+            await channel.send(content)
+            results[str(cid)] = "ok"
+        except discord.HTTPException as e:
+            logging.exception("Broadcast send failed for channel %s", cid)
+            results[str(cid)] = f"error: {e}"
+
+    ok = all(v == "ok" for v in results.values())
+    return web.json_response({"ok": ok, "results": results}, status=200 if ok else 207)
+
+async def _handle_options(request: web.Request) -> web.StreamResponse:
+    return web.Response(status=204)
+
+@web.middleware
+async def _cors_middleware(request: web.Request, handler):
+    # allow browser calls from the website (fetch + JSON body triggers preflight)
+    if request.method == "OPTIONS":
+        resp = web.Response(status=204)
+    else:
+        resp = await handler(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
 async def _ensure_webhook_server():
-    app = web.Application()
+    app = web.Application(middlewares=[_cors_middleware])
     app.add_routes([
         web.post("/webhook/roll", _handle_roll),
         web.post("/webhook/rollmessage", _handle_rollmessage),
+        web.post("/webhook/broadcast", _handle_broadcast),
+        web.route("OPTIONS", "/{tail:.*}", _handle_options),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
