@@ -1139,13 +1139,84 @@ async def session_cancel(interaction: discord.Interaction):
 # ---- manual (README por DM) ------------------------------------------------
 README_PATH = Path(__file__).parent / "README.md"
 
+def _github_md_to_discord(text: str) -> str:
+    """Convert the README's GitHub markdown to Discord-friendly markdown.
+
+    Discord has no tables, no horizontal rules, headers only up to ###,
+    and anchor links don't work — so tables become bullet lists, #### becomes
+    bold, and the TOC section is dropped.
+    """
+    out: list[str] = []
+    lines = text.splitlines()
+    i = 0
+    skipping_toc = False
+    while i < len(lines):
+        line = lines[i]
+
+        # drop the TOC section entirely (anchor links don't work in Discord)
+        if line.strip() == "## Índice":
+            skipping_toc = True
+            i += 1
+            continue
+        if skipping_toc:
+            if line.startswith("## "):
+                skipping_toc = False  # next section starts; fall through
+            else:
+                i += 1
+                continue
+
+        stripped = line.strip()
+
+        # horizontal rules -> drop
+        if stripped == "---":
+            i += 1
+            continue
+
+        # #### header -> bold line
+        if line.startswith("#### "):
+            out.append(f"**{line[5:].strip()}**")
+            i += 1
+            continue
+
+        # table: header row followed by separator row -> bullets from body rows
+        if stripped.startswith("|") and i + 1 < len(lines) and re.match(r"^\s*\|[\s:|-]+\|\s*$", lines[i + 1]):
+            headers = [c.strip() for c in stripped.strip("|").split("|")]
+            i += 2  # skip header + separator
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                cells += [""] * (len(headers) - len(cells))
+                first = cells[0]
+                rest = " — ".join(c for c in cells[1:] if c)
+                if first and rest:
+                    plain = first.startswith("`") or "**" in first
+                    out.append(f"- {first} — {rest}" if plain else f"- **{first}** — {rest}")
+                elif first or rest:
+                    out.append(f"- {first or rest}")
+                i += 1
+            continue
+
+        out.append(line)
+        i += 1
+
+    # collapse the blank-line runs left behind by dropped elements
+    collapsed: list[str] = []
+    for line in out:
+        if line.strip() == "" and collapsed and collapsed[-1].strip() == "":
+            continue
+        collapsed.append(line)
+    result = "\n".join(collapsed)
+    # masked links to relative paths don't resolve in Discord -> keep just the text
+    result = re.sub(r"\[([^\]]+)\]\((?!https?://)[^)]+\)", r"\1", result)
+    return result
+
 def _manual_chunks() -> list[str]:
-    """Split README.md into Discord-sized chunks, breaking on section headers when possible."""
+    """Split the Discord-converted README into Discord-sized chunks."""
     try:
         text = README_PATH.read_text(encoding="utf-8")
     except OSError:
         return ["⚠️ Não consegui ler o manual (README.md em falta)."]
 
+    text = _github_md_to_discord(text)
     limit = 1900
     chunks: list[str] = []
     current = ""
