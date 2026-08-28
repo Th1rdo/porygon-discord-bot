@@ -154,7 +154,8 @@ Servidor aiohttp na porta `PORT` (default 8080) para disparar rolls de fora do D
 |---|---|---|
 | `POST /webhook/roll` | `{"token", "channel_id", "expression", "message"?}` | Rola dados num canal |
 | `POST /webhook/rollmessage` | `{"token", "channel_id", "expression", "message"}` | Roll com cabeçalho |
-| `POST /webhook/broadcast` | `{"token", "channel_ids": [..], "content"}` | Envia a mesma mensagem a vários canais (máx. 10, conteúdo ≤2000 chars) — usado pelos botões do site |
+| `POST /webhook/broadcast` | `{"token", "channel_ids": [..], "content"}` | Envia a mesma mensagem a vários canais (máx. 10, conteúdo ≤2000 chars) |
+| `POST /webhook/preset` | `{"token", "preset", "target"?}` | Envia uma mensagem **hardcoded** (`BROADCAST_PRESETS` no `bot.py`) aos canais do target (`BROADCAST_CHANNELS`). `target` é `"test"` (default) ou `"prod"` — usado pelos botões do site. Presets atuais: `reconstrucao` |
 
 O `token` tem de bater com a env var `WEBHOOK_TOKEN` (ou `WEBHOOK_SECRET`); o `/broadcast` **recusa** pedidos se nenhuma estiver definida. As respostas têm CORS aberto para chamadas de browser. URL pública: `https://porygon-discord-bot-production.up.railway.app`.
 

@@ -288,6 +288,86 @@ async def _send_roll_to_channel(channel: discord.abc.Messageable, msg: str, head
         text = text[chunk:]
     await channel.send(result_part)
 
+# hardcoded broadcast presets, so the website only needs {token, preset[, target]}
+BROADCAST_CHANNELS = {
+    "test": ["1542985444214579292"],
+    "prod": [
+        "1281641786678448261",
+        "1281645729567346821",
+        "1445798523672072384",
+        "1281645678920994888",
+    ],
+}
+
+BROADCAST_PRESETS = {
+    "reconstrucao": """# ⏳ SOLICITAÇÃO DE RECONSTRUÇÃO TEMPORAL
+-# PROTOCOLO DA ORDEM · REGISTO Nº 14-JF · CLASSIFICAÇÃO: INCOMPLETO
+
+> Foi identificado um intervalo de **14 dias** entre o encerramento de **"O Juízo Final"** e o próximo registo confirmado.
+> Esse período permanece **incompleto**.
+
+Para prosseguir, precisamos de reconstruir as ações do agente durante esse intervalo.
+Responde com base no que o teu personagem **tentou** fazer — não apenas no que conseguiu concluir.
+
+1. Qual foi a **principal coisa** que ele quis fazer nessas duas semanas?
+2. Qual foi a **maior ação concreta** que tentou realizar?
+3. Houve alguém que ele **procurou**, **evitou**, ou com quem **precisava de falar**?
+4. Houve alguma **consequência** do fim da operação que tentou resolver, corrigir ou enfrentar?
+5. Tomou alguma **decisão importante** sobre o que pretende fazer da vida daqui para a frente?
+6. **Mudou** alguma coisa importante nele?
+   -# Relações, objetivos, posição dentro da Ordem, aparência, comportamento, equipamento…
+7. Existe algo que ele **ainda queria fazer**, mas nunca teve oportunidade durante a operação?
+
+## ⚠️ ATENÇÃO
+- **Não assumas** que todas as ações tiveram sucesso — descreve a **intenção**, a **tentativa** e o resultado que o personagem procurava.
+- Ações de grande impacto poderão exigir **validação**, reconstrução adicional ou **execução direta**.
+- O agente **não precisa** de ter feito tudo nestas duas semanas. O fim da operação não é o fim da vida do personagem.
+
+-# ⌛ Aguardando preenchimento do intervalo…""",
+}
+
+async def _broadcast_to(channel_ids: list[str], content: str) -> dict[str, str]:
+    await ready_event.wait()
+    results: dict[str, str] = {}
+    for cid in channel_ids:
+        channel = await _resolve_channel(int(cid))
+        if channel is None:
+            results[str(cid)] = "error: channel not found"
+            continue
+        try:
+            await channel.send(content)
+            results[str(cid)] = "ok"
+        except discord.HTTPException as e:
+            logging.exception("Broadcast send failed for channel %s", cid)
+            results[str(cid)] = f"error: {e}"
+    return results
+
+async def _handle_preset(request: web.Request) -> web.StreamResponse:
+    """The lazy one. Body: {"token": str, "preset": str, "target": "test"|"prod"}
+    target defaults to "test" so nothing goes to the players by accident."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    token = str(data.get("token", ""))
+    if not WEBHOOK_TOKEN or token != WEBHOOK_TOKEN:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    preset = str(data.get("preset", ""))
+    target = str(data.get("target", "test"))
+    if preset not in BROADCAST_PRESETS:
+        return web.json_response(
+            {"error": f"unknown preset. options: {sorted(BROADCAST_PRESETS)}"}, status=400)
+    if target not in BROADCAST_CHANNELS:
+        return web.json_response(
+            {"error": f"unknown target. options: {sorted(BROADCAST_CHANNELS)}"}, status=400)
+
+    results = await _broadcast_to(BROADCAST_CHANNELS[target], BROADCAST_PRESETS[preset])
+    ok = all(v == "ok" for v in results.values())
+    return web.json_response({"ok": ok, "target": target, "results": results},
+                             status=200 if ok else 207)
+
 async def _handle_broadcast(request: web.Request) -> web.StreamResponse:
     """Send the same message to several channels. Body:
     {"token": str, "channel_ids": [int, ...], "content": str}
@@ -309,25 +389,11 @@ async def _handle_broadcast(request: web.Request) -> web.StreamResponse:
         return web.json_response({"error": "content must be a string of 1-2000 chars"}, status=400)
 
     try:
-        cids = [int(c) for c in channel_ids]
+        cids = [str(int(c)) for c in channel_ids]
     except (TypeError, ValueError):
         return web.json_response({"error": "channel_ids must be integers"}, status=400)
 
-    await ready_event.wait()
-
-    results: dict[str, str] = {}
-    for cid in cids:
-        channel = await _resolve_channel(cid)
-        if channel is None:
-            results[str(cid)] = "error: channel not found"
-            continue
-        try:
-            await channel.send(content)
-            results[str(cid)] = "ok"
-        except discord.HTTPException as e:
-            logging.exception("Broadcast send failed for channel %s", cid)
-            results[str(cid)] = f"error: {e}"
-
+    results = await _broadcast_to(cids, content)
     ok = all(v == "ok" for v in results.values())
     return web.json_response({"ok": ok, "results": results}, status=200 if ok else 207)
 
@@ -352,6 +418,7 @@ async def _ensure_webhook_server():
         web.post("/webhook/roll", _handle_roll),
         web.post("/webhook/rollmessage", _handle_rollmessage),
         web.post("/webhook/broadcast", _handle_broadcast),
+        web.post("/webhook/preset", _handle_preset),
         web.route("OPTIONS", "/{tail:.*}", _handle_options),
     ])
     runner = web.AppRunner(app)
