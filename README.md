@@ -138,6 +138,14 @@ Liga/desliga funções por servidor — útil quando outro bot usa o mesmo prefi
 
 Com uma função desligada: o comando `!` fica **em silêncio total** (o outro bot pode responder); o comando `/` responde só a ti a dizer que está desativada.
 
+### 📬 Manual
+
+| Comando | Descrição |
+|---|---|
+| `!manual` / `/manual` | Envia este README por DM, dividido em mensagens (reage 📬 à tua mensagem quando envia) |
+
+O manual é lido do `README.md` em runtime — atualizar este ficheiro atualiza o que o comando envia, sem mexer no código.
+
 ### 🌐 Webhook HTTP
 
 Servidor aiohttp na porta `PORT` (default 8080) para disparar rolls de fora do Discord.

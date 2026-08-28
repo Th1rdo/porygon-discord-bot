@@ -1136,6 +1136,67 @@ async def session_cancel(interaction: discord.Interaction):
     _save_sessions()
     await interaction.response.send_message("🛑 Sessão cancelada.", ephemeral=True)
 
+# ---- manual (README por DM) ------------------------------------------------
+README_PATH = Path(__file__).parent / "README.md"
+
+def _manual_chunks() -> list[str]:
+    """Split README.md into Discord-sized chunks, breaking on section headers when possible."""
+    try:
+        text = README_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ["⚠️ Não consegui ler o manual (README.md em falta)."]
+
+    limit = 1900
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        # start a fresh chunk on top-level sections to keep them together
+        if line.startswith("## ") and len(current) > limit // 2:
+            chunks.append(current)
+            current = ""
+        if len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current)
+    return chunks
+
+async def _send_manual(user: discord.User | discord.Member) -> bool:
+    try:
+        for chunk in _manual_chunks():
+            await user.send(chunk)
+        return True
+    except discord.Forbidden:
+        return False
+    except discord.HTTPException:
+        logging.exception("Failed to DM manual to %s", user)
+        return False
+
+@bot.command(name="manual")
+async def manual_cmd(ctx):
+    """Envia o manual do bot por DM."""
+    ok = await _send_manual(ctx.author)
+    if ok:
+        try:
+            await ctx.message.add_reaction("📬")
+        except discord.HTTPException:
+            pass
+    else:
+        await ctx.send("Não consegui enviar DM — verifica se tens DMs abertas para membros deste servidor.")
+
+@bot.tree.command(name="manual", description="Receber o manual do Porygon por DM")
+async def manual_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    ok = await _send_manual(interaction.user)
+    if ok:
+        await interaction.followup.send("📬 Manual enviado por DM!", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            "Não consegui enviar DM — verifica se tens DMs abertas para membros deste servidor.",
+            ephemeral=True,
+        )
+
 # ---- graceful shutdown -----------------------------------------------------
 def _shutdown(*_):
     logging.info("Shutting down...")
