@@ -1264,13 +1264,37 @@ async def session_cancel(interaction: discord.Interaction):
     await interaction.response.send_message("🛑 Sessão cancelada.", ephemeral=True)
 
 # ---- send_message (falar pelo bot) -----------------------------------------
+class _SendMessageModal(discord.ui.Modal, title="Enviar mensagem pelo bot"):
+    def __init__(self, channel: discord.TextChannel):
+        super().__init__()
+        self.channel = channel
+        self.message = discord.ui.TextInput(
+            label=f"Mensagem para #{channel.name}"[:45],
+            style=discord.TextStyle.paragraph,
+            placeholder="Escreve aqui — Enter faz linha nova, markdown funciona.",
+            max_length=2000,
+        )
+        self.add_item(self.message)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await self.channel.send(str(self.message.value))
+        except discord.HTTPException as e:
+            await interaction.response.send_message(f"Falha ao enviar: {e}", ephemeral=True)
+            return
+        await interaction.response.send_message(f"📨 Enviado para {self.channel.mention}.", ephemeral=True)
+
 @bot.tree.command(name="send_message", description="Enviar uma mensagem pelo bot para um canal (só admins)")
 async def send_message_slash(interaction: discord.Interaction,
                              channel: discord.TextChannel,
-                             message: str):
+                             message: str | None = None):
     if not await _require_manager_slash(interaction):
         return
-    # slash inputs are single-line; allow literal \n for line breaks
+    # without a message, open a modal — its textbox supports real multiline
+    if message is None:
+        await interaction.response.send_modal(_SendMessageModal(channel))
+        return
+    # inline message: slash inputs are single-line; allow literal \n for line breaks
     content = message.replace("\\n", "\n")
     try:
         await channel.send(content)

@@ -144,7 +144,8 @@ Só para admins/gestores. O bot envia a mensagem como se fosse ele a falar.
 
 | Comando | Descrição |
 |---|---|
-| `/send_message <canal> <mensagem>` | Envia a mensagem ao canal escolhido (escreve `\n` para quebras de linha) |
+| `/send_message <canal>` | **Sem** mensagem: abre um formulário com caixa de texto multilinha (Enter = linha nova) |
+| `/send_message <canal> <mensagem>` | Com mensagem inline: envia direto (escreve `\n` para quebras de linha) |
 | `!send_message <channel_id> <mensagem>` | Versão prefixo — aceita mensagens multilinha e `#canal` ou ID |
 
 ### 📬 Manual
