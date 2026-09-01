@@ -22,7 +22,8 @@ logging.basicConfig(level=logging.INFO)
 # ---- discord setup ---------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+# help_command=None: frees "!help" for other bots (Avrae) — ours is "!ajuda"
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 ready_event = asyncio.Event()
 
 @bot.event
@@ -1327,88 +1328,42 @@ async def send_message_cmd(ctx, channel_id: str, *, message: str):
     except discord.HTTPException:
         pass
 
-# ---- manual (README por DM) ------------------------------------------------
-README_PATH = Path(__file__).parent / "README.md"
+# ---- ajuda / manual ---------------------------------------------------------
+# Compact Avrae-style command reference, grouped by category.
+AJUDA_TEXT = """# 📖 Manual do Bot
+Bot da campanha — dados, missões, countdowns e agendamento de sessões.
+-# `<arg>` = obrigatório · `[arg]` = opcional · 🔒 = só admins/gestores (*Manage Server*)
 
-def _github_md_to_discord(text: str) -> str:
-    """Convert the README's GitHub markdown to Discord-friendly markdown.
+## 🎲 Dados
+- `!roll <dados>` — Rola no formato XdY ± Z. Ex.: `!roll 6d6 + 2`, `!roll 3d20` (também `/roll`)
 
-    Discord has no tables, no horizontal rules, headers only up to ###,
-    and anchor links don't work — so tables become bullet lists, #### becomes
-    bold, and the TOC section is dropped.
-    """
-    out: list[str] = []
-    lines = text.splitlines()
-    i = 0
-    skipping_toc = False
-    while i < len(lines):
-        line = lines[i]
+## 🎬 Missões
+- `!mission <id>` — Envia o ficheiro da missão. Ex.: `!mission 001` (também `/mission`)
 
-        # drop the TOC section entirely (anchor links don't work in Discord)
-        if line.strip() == "## Índice":
-            skipping_toc = True
-            i += 1
-            continue
-        if skipping_toc:
-            if line.startswith("## "):
-                skipping_toc = False  # next section starts; fall through
-            else:
-                i += 1
-                continue
+## ⏳ Countdown
+- `!countdown <tempo> [legenda]` — Timer ao vivo, atualizado a cada segundo. Ex.: `!countdown 1h30m Início do evento`
+- `!countdown stop` — Para o countdown ativo
+- `!countdown` — Ajuda detalhada do countdown (também `/countdown`, `/countdown_stop`)
+-# Tempos: `90`, `90s`, `5m`, `1h30m`, `mm:ss`, `hh:mm:ss` · máx. 24h · um por servidor
 
-        stripped = line.strip()
+## 🗓️ Sessões 🔒
+- `/session_propose <title> <when> [chapter] [subtitle] [deadline]` — Propõe uma data e pede ✅/❌ até um prazo; quem não responder leva lembrete no chat pessoal
+- `/session_announce <title> <when> [chapter] [subtitle]` — Anúncio de hype para sessão já marcada
+- `/session_status` — Vê quem confirmou / falta responder
+- `/session_cancel` — Cancela a sessão ativa
+- `/session_setup [role] [timezone] [remind_hours_before]` — Configura role a pingar, fuso e antecedência do lembrete
+- `/session_player <player> [personal_channel]` — Regista um jogador e o seu chat pessoal
+- `/session_players` · `/session_player_remove <player>` — Lista / remove jogadores
+-# Datas: `AAAA-MM-DD HH:MM` (fuso do servidor), `DD/MM/AAAA HH:MM`, timestamp Unix ou `<t:...:F>` colado
+-# Automático: resumo no deadline → lembrete 24h antes → "É HOJE!" → fecho 3h depois
 
-        # horizontal rules -> drop
-        if stripped == "---":
-            i += 1
-            continue
+## 🛠️ Utilidades
+- `!config` 🔒 — Liga/desliga funções neste servidor. Ex.: `!config disable roll` (também `/config`)
+- `/send_message <canal> [mensagem]` 🔒 — Fala pelo bot; sem mensagem abre caixa de texto multilinha
+- `!ajuda` — Mostra esta lista (também `/ajuda`)
+- `!manual` — Recebe esta lista por DM (também `/manual`)"""
 
-        # #### header -> bold line
-        if line.startswith("#### "):
-            out.append(f"**{line[5:].strip()}**")
-            i += 1
-            continue
-
-        # table: header row followed by separator row -> bullets from body rows
-        if stripped.startswith("|") and i + 1 < len(lines) and re.match(r"^\s*\|[\s:|-]+\|\s*$", lines[i + 1]):
-            headers = [c.strip() for c in stripped.strip("|").split("|")]
-            i += 2  # skip header + separator
-            while i < len(lines) and lines[i].strip().startswith("|"):
-                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
-                cells += [""] * (len(headers) - len(cells))
-                first = cells[0]
-                rest = " — ".join(c for c in cells[1:] if c)
-                if first and rest:
-                    plain = first.startswith("`") or "**" in first
-                    out.append(f"- {first} — {rest}" if plain else f"- **{first}** — {rest}")
-                elif first or rest:
-                    out.append(f"- {first or rest}")
-                i += 1
-            continue
-
-        out.append(line)
-        i += 1
-
-    # collapse the blank-line runs left behind by dropped elements
-    collapsed: list[str] = []
-    for line in out:
-        if line.strip() == "" and collapsed and collapsed[-1].strip() == "":
-            continue
-        collapsed.append(line)
-    result = "\n".join(collapsed)
-    # masked links to relative paths don't resolve in Discord -> keep just the text
-    result = re.sub(r"\[([^\]]+)\]\((?!https?://)[^)]+\)", r"\1", result)
-    return result
-
-def _manual_chunks() -> list[str]:
-    """Split the Discord-converted README into Discord-sized chunks."""
-    try:
-        text = README_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return ["⚠️ Não consegui ler o manual (README.md em falta)."]
-
-    text = _github_md_to_discord(text)
-    limit = 1900
+def _split_discord_chunks(text: str, limit: int = 1900) -> list[str]:
     chunks: list[str] = []
     current = ""
     for line in text.splitlines():
@@ -1423,6 +1378,22 @@ def _manual_chunks() -> list[str]:
     if current.strip():
         chunks.append(current)
     return chunks
+
+@bot.command(name="ajuda")
+async def ajuda_cmd(ctx):
+    """Mostra a lista de comandos."""
+    for chunk in _split_discord_chunks(AJUDA_TEXT):
+        await ctx.send(chunk)
+
+@bot.tree.command(name="ajuda", description="Ver a lista de comandos do bot")
+async def ajuda_slash(interaction: discord.Interaction):
+    chunks = _split_discord_chunks(AJUDA_TEXT)
+    await interaction.response.send_message(chunks[0], ephemeral=True)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=True)
+
+def _manual_chunks() -> list[str]:
+    return _split_discord_chunks(AJUDA_TEXT)
 
 async def _send_manual(user: discord.User | discord.Member) -> bool:
     try:

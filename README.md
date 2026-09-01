@@ -148,13 +148,14 @@ Só para admins/gestores. O bot envia a mensagem como se fosse ele a falar.
 | `/send_message <canal> <mensagem>` | Com mensagem inline: envia direto (escreve `\n` para quebras de linha) |
 | `!send_message <channel_id> <mensagem>` | Versão prefixo — aceita mensagens multilinha e `#canal` ou ID |
 
-### 📬 Manual
+### 📬 Ajuda e Manual
 
 | Comando | Descrição |
 |---|---|
-| `!manual` / `/manual` | Envia este README por DM, dividido em mensagens (reage 📬 à tua mensagem quando envia) |
+| `!ajuda` / `/ajuda` | Lista compacta de comandos por categoria (estilo Avrae). A versão slash responde só a ti |
+| `!manual` / `/manual` | A mesma lista, mas enviada por DM (reage 📬 quando envia) |
 
-O manual é lido do `README.md` em runtime — atualizar este ficheiro atualiza o que o comando envia, sem mexer no código.
+O texto vive em `AJUDA_TEXT` no `bot.py` — ao adicionar um comando novo, acrescenta-o lá (e aqui). O `!help` embutido do discord.py está **desativado** para não entrar em conflito com outros bots (ex.: Avrae).
 
 ### 🌐 Webhook HTTP
 
