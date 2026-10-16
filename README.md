@@ -17,6 +17,7 @@ Bot de Discord para as campanhas de TTRPG — dados, missões, countdowns e agen
    - [🎬 Mission (media)](#-mission-media)
    - [⏳ Countdown](#-countdown)
    - [🗓️ Sessões (agendamento + confirmações)](#️-sessões-agendamento--confirmações)
+   - [🕵️ Ficha Paranormal (convite para o site)](#️-ficha-paranormal-convite-para-o-site)
    - [⚙️ Config por servidor](#️-config-por-servidor)
    - [🌐 Webhook HTTP](#-webhook-http)
 2. [Persistência de dados](#persistência-de-dados)
@@ -125,6 +126,24 @@ As confirmações são lidas **das reações da mensagem original** (✅/❌), c
 |---|---|
 | `/session_status` | Vê quem confirmou/não confirmou (só tu vês) |
 | `/session_cancel` | Cancela/limpa a sessão ativa |
+
+### 🕵️ Ficha Paranormal (convite para o site)
+
+Qualquer pessoa no servidor pode liberar **o seu** e-mail no site da ficha ([ordemcodex.xyz](https://ordemcodex.xyz)), que é só para convidados.
+
+| Comando | Descrição |
+|---|---|
+| `/ficha_convite <email>` | Põe o e-mail na lista de convidados. Resposta **só para quem usou** (ephemeral). Um e-mail por conta do Discord |
+
+Como funciona: o bot chama a função `ficha_paranormal.invite_from_discord` no Supabase do site (projeto hub
+`zktdrataxwkfrdjdkrsl`) com a chave *publishable* (pública). A função só sabe **acrescentar** convites, confere o
+segredo `FICHA_INVITE_SECRET` (na base fica só o hash SHA-256, tabela `ficha_paranormal.integration_secrets`) e
+guarda o `discord_user_id` — se a pessoa já liberou outro e-mail, recusa e manda falar com o Tiago.
+Desligar num servidor: `/config disable ficha`.
+
+Variáveis: `FICHA_INVITE_SECRET` (obrigatória para a função), `FICHA_SUPABASE_URL` / `FICHA_SUPABASE_KEY` (opcionais).
+Trocar o segredo: gerar um novo, pôr o hash com `update ficha_paranormal.integration_secrets set secret_hash =
+encode(extensions.digest('<novo>', 'sha256'), 'hex') where name = 'discord_bot';` e atualizar a variável no Railway.
 
 ### ⚙️ Config por servidor
 

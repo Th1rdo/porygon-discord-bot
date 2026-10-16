@@ -10,6 +10,7 @@ import asyncio
 import aiohttp
 from aiohttp import web
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 # ---- env / logging ---------------------------------------------------------
@@ -53,7 +54,7 @@ import json
 from pathlib import Path as _Path
 
 # Toggleable features. A feature is ON unless a guild explicitly turns it off.
-FEATURES = ("roll", "mission", "countdown")
+FEATURES = ("roll", "mission", "countdown", "ficha")
 
 # Config is stored as JSON on a persistent path. On Railway, mount a volume and
 # point DATA_DIR at it (e.g. /data) so settings survive redeploys/restarts.
@@ -1328,6 +1329,73 @@ async def send_message_cmd(ctx, channel_id: str, *, message: str):
     except discord.HTTPException:
         pass
 
+# ---- Ficha Paranormal: convite para o site -----------------------------------
+# /ficha_convite <email> → põe o e-mail na lista de convidados de https://ordemcodex.xyz.
+# O bot não tem chave de admin: chama a função ficha_paranormal.invite_from_discord no Supabase, que só sabe
+# acrescentar convites, confere o segredo FICHA_INVITE_SECRET (guardado só como hash na base) e deixa
+# UM e-mail por utilizador do Discord. A URL e a chave publishable são públicas (as mesmas do site).
+FICHA_SITE = "https://ordemcodex.xyz"
+FICHA_SUPABASE_URL = os.getenv("FICHA_SUPABASE_URL", "https://zktdrataxwkfrdjdkrsl.supabase.co")
+FICHA_SUPABASE_KEY = os.getenv("FICHA_SUPABASE_KEY", "sb_publishable_Ou76QfuuHEbRUeuEkxOW6Q_36E6j0qN")
+FICHA_INVITE_SECRET = os.getenv("FICHA_INVITE_SECRET")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+
+async def _ficha_invite(email: str, user: discord.abc.User) -> str:
+    """Devolve o estado da função: added | already_invited | already_linked:<e-mail> | invalid_email | unauthorized."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        async with session.post(
+            f"{FICHA_SUPABASE_URL}/rest/v1/rpc/invite_from_discord",
+            headers={
+                "apikey": FICHA_SUPABASE_KEY,
+                "Content-Type": "application/json",
+                "Content-Profile": "ficha_paranormal",
+            },
+            json={
+                "p_email": email,
+                "p_discord_user_id": str(user.id),
+                "p_discord_name": user.name,
+                "p_secret": FICHA_INVITE_SECRET,
+            },
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Supabase HTTP {resp.status}: {(await resp.text())[:200]}")
+            return await resp.json()
+
+@bot.tree.command(name="ficha_convite", description="Liberar o teu e-mail no site da Ficha Paranormal (ordemcodex.xyz)")
+@app_commands.describe(email="O e-mail com que vais entrar no site")
+async def ficha_convite_slash(interaction: discord.Interaction, email: str):
+    if not feature_enabled(interaction.guild_id, "ficha"):
+        await interaction.response.send_message("Esta função está desativada neste servidor.", ephemeral=True)
+        return
+    email = email.strip().lower()
+    if not _EMAIL_RE.match(email):
+        await interaction.response.send_message("Isso não parece um e-mail. Ex.: `/ficha_convite email:nome@gmail.com`", ephemeral=True)
+        return
+    if not FICHA_INVITE_SECRET:
+        await interaction.response.send_message("Os convites ainda não estão configurados neste bot. Fala com o Tiago.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        status = await _ficha_invite(email, interaction.user)
+    except Exception:
+        logging.exception("ficha_convite failed")
+        await interaction.followup.send("Não consegui falar com o site agora. Tenta de novo daqui a pouco.", ephemeral=True)
+        return
+    entrar = f"Abre {FICHA_SITE}, escreve **{email}** e carrega em **Continuar** — o site pede-te para criares a senha."
+    if status == "added":
+        msg = f"✅ Feito! **{email}** está liberado na Ficha Paranormal.\n{entrar}"
+    elif status == "already_invited":
+        msg = f"ℹ️ **{email}** já estava liberado.\n{entrar}"
+    elif isinstance(status, str) and status.startswith("already_linked:"):
+        msg = (f"Já liberaste **{status.split(':', 1)[1]}** com a tua conta do Discord (é um e-mail por pessoa). "
+               "Se precisas de trocar, fala com o Tiago.")
+    elif status == "invalid_email":
+        msg = "Esse e-mail não é válido. Confere e tenta de novo."
+    else:
+        logging.error("ficha_convite: unexpected status %r", status)
+        msg = "Algo correu mal com o convite. Fala com o Tiago."
+    await interaction.followup.send(msg, ephemeral=True)
+
 # ---- ajuda / manual ---------------------------------------------------------
 # Compact Avrae-style command reference, grouped by category.
 AJUDA_TEXT = """# 📖 Manual do Bot
@@ -1356,6 +1424,9 @@ Bot da campanha — dados, missões, countdowns e agendamento de sessões.
 - `/session_players` · `/session_player_remove <player>` — Lista / remove jogadores
 -# Datas: `AAAA-MM-DD HH:MM` (fuso do servidor), `DD/MM/AAAA HH:MM`, timestamp Unix ou `<t:...:F>` colado
 -# Automático: resumo no deadline → lembrete 24h antes → "É HOJE!" → fecho 3h depois
+
+## 🕵️ Ficha Paranormal
+- `/ficha_convite <email>` — Libera o teu e-mail no site da ficha (ordemcodex.xyz). Resposta só para ti · um e-mail por pessoa
 
 ## 🛠️ Utilidades
 - `!config` 🔒 — Liga/desliga funções neste servidor. Ex.: `!config disable roll` (também `/config`)
