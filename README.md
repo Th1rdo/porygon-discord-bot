@@ -141,7 +141,12 @@ segredo `FICHA_INVITE_SECRET` (na base fica só o hash SHA-256, tabela `ficha_pa
 guarda o `discord_user_id` — se a pessoa já liberou outro e-mail, recusa e manda falar com o Tiago.
 Desligar num servidor: `/config disable ficha`.
 
-Variáveis: `FICHA_INVITE_SECRET` (obrigatória para a função), `FICHA_SUPABASE_URL` / `FICHA_SUPABASE_KEY` (opcionais).
+Só funciona **dentro de servidores** (não em DM). Se a resposta disser que o e-mail já tem conta, manda entrar com a
+senha (ou "Esqueci a senha"); senão, criar a senha. Trocar o e-mail de alguém = o Tiago apaga a linha em
+`ficha_paranormal.allowed_emails`.
+
+Variáveis: `FICHA_INVITE_SECRET` (obrigatória para a função), `FICHA_GUILD_IDS` (opcional — IDs de servidor separados
+por vírgula; vazio = qualquer servidor onde o bot está), `FICHA_SUPABASE_URL` / `FICHA_SUPABASE_KEY` (opcionais).
 Trocar o segredo: gerar um novo, pôr o hash com `update ficha_paranormal.integration_secrets set secret_hash =
 encode(extensions.digest('<novo>', 'sha256'), 'hex') where name = 'discord_bot';` e atualizar a variável no Railway.
 

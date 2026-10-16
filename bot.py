@@ -1338,7 +1338,9 @@ FICHA_SITE = "https://ordemcodex.xyz"
 FICHA_SUPABASE_URL = os.getenv("FICHA_SUPABASE_URL", "https://zktdrataxwkfrdjdkrsl.supabase.co")
 FICHA_SUPABASE_KEY = os.getenv("FICHA_SUPABASE_KEY", "sb_publishable_Ou76QfuuHEbRUeuEkxOW6Q_36E6j0qN")
 FICHA_INVITE_SECRET = os.getenv("FICHA_INVITE_SECRET")
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+# Opcional: só estes servidores (IDs separados por vírgula). Vazio = qualquer servidor onde o bot está (nunca DM).
+FICHA_GUILD_IDS = {int(x) for x in os.getenv("FICHA_GUILD_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+_EMAIL_RE = re.compile(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$")  # igual à da função na base
 
 async def _ficha_invite(email: str, user: discord.abc.User) -> str:
     """Devolve o estado da função: added | already_invited | already_linked:<e-mail> | invalid_email | unauthorized."""
@@ -1358,12 +1360,17 @@ async def _ficha_invite(email: str, user: discord.abc.User) -> str:
             },
         ) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"Supabase HTTP {resp.status}: {(await resp.text())[:200]}")
+                # Sem o corpo da resposta no log: pode conter o e-mail.
+                raise RuntimeError(f"Supabase HTTP {resp.status}")
             return await resp.json()
 
 @bot.tree.command(name="ficha_convite", description="Liberar o teu e-mail no site da Ficha Paranormal (ordemcodex.xyz)")
+@app_commands.guild_only()  # em DM não há /config para desligar
 @app_commands.describe(email="O e-mail com que vais entrar no site")
 async def ficha_convite_slash(interaction: discord.Interaction, email: str):
+    if interaction.guild_id is None or (FICHA_GUILD_IDS and interaction.guild_id not in FICHA_GUILD_IDS):
+        await interaction.response.send_message("Este comando só funciona no servidor da campanha.", ephemeral=True)
+        return
     if not feature_enabled(interaction.guild_id, "ficha"):
         await interaction.response.send_message("Esta função está desativada neste servidor.", ephemeral=True)
         return
@@ -1381,16 +1388,26 @@ async def ficha_convite_slash(interaction: discord.Interaction, email: str):
         logging.exception("ficha_convite failed")
         await interaction.followup.send("Não consegui falar com o site agora. Tenta de novo daqui a pouco.", ephemeral=True)
         return
-    entrar = f"Abre {FICHA_SITE}, escreve **{email}** e carrega em **Continuar** — o site pede-te para criares a senha."
+    has_account = isinstance(status, str) and status.endswith(":has_account")
+    if has_account:
+        status = status[: -len(":has_account")]
+    if has_account:
+        entrar = (f"Abre {FICHA_SITE}, escreve `{email}`, carrega em **Continuar** e entra com a tua senha "
+                  "(se não te lembras, há **Esqueci a senha** lá mesmo).")
+    else:
+        entrar = f"Abre {FICHA_SITE}, escreve `{email}` e carrega em **Continuar** — o site pede-te para criares a senha."
     if status == "added":
-        msg = f"✅ Feito! **{email}** está liberado na Ficha Paranormal.\n{entrar}"
+        msg = f"✅ Feito! `{email}` está liberado na Ficha Paranormal.\n{entrar}"
     elif status == "already_invited":
-        msg = f"ℹ️ **{email}** já estava liberado.\n{entrar}"
+        msg = f"ℹ️ `{email}` já estava liberado.\n{entrar}"
     elif isinstance(status, str) and status.startswith("already_linked:"):
-        msg = (f"Já liberaste **{status.split(':', 1)[1]}** com a tua conta do Discord (é um e-mail por pessoa). "
+        msg = (f"Já liberaste `{status.split(':', 1)[1]}` com a tua conta do Discord (é um e-mail por pessoa). "
                "Se precisas de trocar, fala com o Tiago.")
     elif status == "invalid_email":
         msg = "Esse e-mail não é válido. Confere e tenta de novo."
+    elif status == "unauthorized":
+        logging.error("ficha_convite: secret mismatch — FICHA_INVITE_SECRET não bate com o hash no Supabase (rodar?)")
+        msg = "Os convites estão com um problema de configuração. Fala com o Tiago."
     else:
         logging.error("ficha_convite: unexpected status %r", status)
         msg = "Algo correu mal com o convite. Fala com o Tiago."
