@@ -18,6 +18,7 @@ Bot de Discord para as campanhas de TTRPG — dados, missões, countdowns e agen
    - [⏳ Countdown](#-countdown)
    - [🗓️ Sessões (agendamento + confirmações)](#️-sessões-agendamento--confirmações)
    - [🕵️ Ficha Paranormal (convite para o site)](#️-ficha-paranormal-convite-para-o-site)
+   - [🎲 Rolagens da ficha → Discord](#-rolagens-da-ficha--discord)
    - [⚙️ Config por servidor](#️-config-por-servidor)
    - [🌐 Webhook HTTP](#-webhook-http)
 2. [Persistência de dados](#persistência-de-dados)
@@ -150,6 +151,69 @@ por vírgula; vazio = qualquer servidor onde o bot está), `FICHA_SUPABASE_URL` 
 Trocar o segredo: gerar um novo, pôr o hash com `update ficha_paranormal.integration_secrets set secret_hash =
 encode(extensions.digest('<novo>', 'sha256'), 'hex') where name = 'discord_bot';` e atualizar a variável no Railway.
 
+### 🎲 Rolagens da ficha → Discord
+
+Quando um jogador rola algo na ficha ([ordemcodex.xyz](https://ordemcodex.xyz)), o site manda a rolagem ao bot e o
+bot publica um embed compacto no canal `FICHA_ROLL_CHANNEL_ID` (por agora fixo: `1165819468354687066`; mais tarde
+escolhe-se por DM). **Não há segredo no browser**: o site envia o *access token* do Supabase do jogador e o bot
+confirma-o no servidor.
+
+**`POST /webhook/ficha-roll`**
+
+```http
+POST /webhook/ficha-roll
+Authorization: Bearer <access_token da sessão Supabase do jogador>
+Content-Type: application/json
+
+{
+  "agent": "Joui",                 // obrigatório, texto
+  "title": "Luta",                 // obrigatório, texto
+  "kind": "pericia",               // atributo | pericia | ataque | ritual | livre
+  "notation": "2d20kh1+5",         // opcional — aparece em `código`
+  "dice": "[18, 7]",               // opcional — dados rolados
+  "total": 23,                     // número (opcional se houver attack/damage)
+  "attack": { "total": 25, "critical": 1, "info": "margem 19" },   // opcional; critical: -1 falha, 0, 1 crítico
+  "damage": { "total": 14, "breakdown": "1d8+3 [5] +6" },          // opcional
+  "extra": "texto livre"           // opcional
+}
+```
+
+Regras: corpo ≤ **4 KB** (senão `413`); textos numa linha só e cortados a **200** caracteres (com `…`); números
+finitos com |n| ≤ 1 000 000; tem de haver `total`, `attack` ou `damage`; campos desconhecidos são ignorados.
+Todo o texto do jogador é **escapado** (markdown) e o embed vai com `allowed_mentions=none` (nunca pinga ninguém).
+
+Respostas (JSON):
+
+| Status | Corpo | Quando |
+|---|---|---|
+| `200` | `{"ok": true, "message_id": "…", "channel_id": "…"}` | Publicado |
+| `400` | `{"ok": false, "error": "invalid_json"}` / `{"ok": false, "error": "invalid_payload", "detail": "…"}` | Corpo inválido |
+| `401` | `{"ok": false, "error": "unauthorized"}` | Sem `Authorization: Bearer`, token inválido/expirado |
+| `403` | `{"ok": false, "error": "not_allowed"}` | Conta válida mas fora da lista de convidados |
+| `413` | `{"ok": false, "error": "payload_too_large"}` | Corpo > 4 KB |
+| `429` | `{"ok": false, "error": "rate_limited", "retry_after": <segundos inteiros>}` + header `Retry-After` (mesmo valor) | > 8 rolagens / 10 s por conta; ou verificações de token novas acima de 30 / min por IP **ou** 120 / min no total |
+| `502` | `{"ok": false, "error": "discord_error"}` | O Discord recusou o envio |
+| `503` | `{"ok": false, "error": "auth_unavailable" \| "channel_unavailable" \| "disabled"}` | Supabase em baixo / canal inacessível / `ficha_roll` desligada no servidor do canal |
+
+Como autentica: `GET {FICHA_SUPABASE_URL}/auth/v1/user` (com `apikey` + o Bearer) tem de dar 200 **e**
+`POST /rest/v1/rpc/am_i_allowed` (header `Content-Profile: ficha_paranormal`, mesmo Bearer) tem de devolver `true`.
+As duas chamadas correm em paralelo; o resultado positivo fica em cache **5 min** por token (só o hash SHA-256 do
+token, e nunca além do `exp` do JWT) e um token recusado (401) fica em cache negativa **60 s**. Verificações novas no
+Supabase têm dois limites: **30/min por IP** (IP = `X-Real-IP` ou o hop **mais à direita** do `X-Forwarded-For`,
+nunca o da esquerda, que o cliente controla) e um **teto global de 120/min** que não depende de headers — mesmo
+com IPs falsificados ninguém martela o Supabase através do bot.
+
+CORS desta rota: só `https://ordemcodex.xyz`, `https://www.ordemcodex.xyz`,
+`https://ficha-paranormal-preview-production.up.railway.app` e `http://localhost:5184` (dev), com
+`Authorization` permitido (as outras rotas continuam com `*`). No arranque o bot só **regista nos logs** se o canal
+existe e se tem `send_messages` / `embed_links` (procura `ficha-roll:` nos logs) — não publica nada.
+Desligar só as rolagens: `/config disable ficha_roll` no servidor do canal (responde `503 disabled`); a função
+`ficha` (convites) é independente. Se o envio falhar com *Forbidden*/*Not Found*, o bot esquece o canal em cache e
+volta a resolvê-lo no pedido seguinte (repor a permissão/canal não precisa de restart).
+
+Variáveis: `FICHA_ROLL_CHANNEL_ID` (default `1165819468354687066`), `FICHA_ROLL_ORIGINS` (opcional — substitui a
+lista de origens, separadas por vírgula), mais `FICHA_SUPABASE_URL` / `FICHA_SUPABASE_KEY` (as mesmas do convite).
+
 ### ⚙️ Config por servidor
 
 Liga/desliga funções por servidor — útil quando outro bot usa o mesmo prefixo `!`. Só admins/gestores.
@@ -157,7 +221,7 @@ Liga/desliga funções por servidor — útil quando outro bot usa o mesmo prefi
 | Comando | Descrição |
 |---|---|
 | `!config` / `/config` | Mostra o estado das funções e a ajuda |
-| `!config disable <função>` | Desliga (`roll`, `mission` ou `countdown`) |
+| `!config disable <função>` | Desliga (`roll`, `mission`, `countdown`, `ficha` = `/ficha_convite`, `ficha_roll` = rolagens do site) |
 | `!config enable <função>` | Volta a ligar |
 
 Com uma função desligada: o comando `!` fica **em silêncio total** (o outro bot pode responder); o comando `/` responde só a ti a dizer que está desativada.
@@ -190,9 +254,10 @@ Servidor aiohttp na porta `PORT` (default 8080) para disparar rolls de fora do D
 | `POST /webhook/roll` | `{"token", "channel_id", "expression", "message"?}` | Rola dados num canal |
 | `POST /webhook/rollmessage` | `{"token", "channel_id", "expression", "message"}` | Roll com cabeçalho |
 | `POST /webhook/broadcast` | `{"token", "channel_ids": [..], "content"}` | Envia a mesma mensagem a vários canais (máx. 10, conteúdo ≤2000 chars) |
+| `POST /webhook/ficha-roll` | ver [Rolagens da ficha](#-rolagens-da-ficha--discord) | Rolagem vinda da ficha; auth = token Supabase do jogador (sem `token`) |
 | `POST /webhook/preset` | `{"token", "preset", "target"?}` | Envia uma mensagem **hardcoded** (`BROADCAST_PRESETS` no `bot.py`) aos canais do target (`BROADCAST_CHANNELS`). `target` é `"test"` (default) ou `"prod"` — usado pelos botões do site. Presets atuais: `reconstrucao` |
 
-O `token` tem de bater com a env var `WEBHOOK_TOKEN` (ou `WEBHOOK_SECRET`); o `/broadcast` **recusa** pedidos se nenhuma estiver definida. As respostas têm CORS aberto para chamadas de browser. URL pública: `https://porygon-discord-bot-production.up.railway.app`.
+O `token` tem de bater com a env var `WEBHOOK_TOKEN` (ou `WEBHOOK_SECRET`); o `/broadcast` **recusa** pedidos se nenhuma estiver definida. As respostas têm CORS aberto para chamadas de browser (exceto `/webhook/ficha-roll`, que só aceita as origens do site). URL pública: `https://porygon-discord-bot-production.up.railway.app`.
 
 ---
 
@@ -225,6 +290,11 @@ Se `DATA_DIR` não for gravável (dev local, ou volume mal montado), o bot avisa
 | `WEBHOOK_TOKEN` | — | Protege os endpoints do webhook |
 | `DATA_DIR` | — | Pasta de dados (default `/data`) |
 | `PORT` | — | Porta do webhook (o Railway define) |
+| `FICHA_INVITE_SECRET` | — | Segredo do `/ficha_convite` (ver acima) |
+| `FICHA_GUILD_IDS` | — | Servidores onde o `/ficha_convite` funciona (vazio = todos) |
+| `FICHA_ROLL_CHANNEL_ID` | — | Canal das rolagens da ficha (default `1165819468354687066`) |
+| `FICHA_ROLL_ORIGINS` | — | Origens CORS do `/webhook/ficha-roll` (default: site, www, preview, `localhost:5184`) |
+| `FICHA_SUPABASE_URL` / `FICHA_SUPABASE_KEY` | — | Supabase do site (defaults = projeto hub + chave publishable) |
 
 **Fluxo normal de trabalho:** editar `bot.py` → commit → `git push` → o Railway faz build e redeploy sozinho (1–2 min). Os slash commands sincronizam no arranque (`on_ready`); comandos novos podem demorar uns minutos a aparecer no Discord.
 
@@ -244,8 +314,16 @@ Verificação rápida de sintaxe sem arrancar o bot:
 .venv/bin/python -m py_compile bot.py
 ```
 
+Testes (rolagens da ficha: validação, texto do embed, rate limiter e o handler HTTP com Supabase/Discord falsos —
+não tocam em nada real). Importar `bot.py` não arranca o bot (`bot.run` está atrás de `if __name__ == "__main__"`):
+
+```bash
+.venv/bin/python tests/test_ficha_roll.py      # ou: .venv/bin/python -m pytest tests/ (se tiveres pytest)
+```
+
 ### Estrutura do `bot.py`
 
 O ficheiro está organizado por secções (procura pelos comentários `# ---- ... ----`):
 
-`env/logging` → `discord setup` → `per-guild config` → `roll core` → `webhook HTTP server` → comandos `roll` → `mission` → `countdown` → `config` → `session scheduler` (parsing de datas, mensagens, loop de lembretes, comandos) → `graceful shutdown`.
+`env/logging` → `discord setup` → `per-guild config` → `roll core` → `webhook HTTP server` → comandos `roll` → `mission` → `countdown` → `config` → `session scheduler` (parsing de datas, mensagens, loop de lembretes, comandos) → `send_message` →
+`Ficha Paranormal: convite` → `Ficha Paranormal: rolagens da ficha → Discord` → `ajuda / manual` → `graceful shutdown`.

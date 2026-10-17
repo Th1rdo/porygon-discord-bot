@@ -44,6 +44,9 @@ async def on_ready():
             bot._web_started = True
         except Exception:
             logging.exception("Failed to start webhook server")
+    if not getattr(bot, "_ficha_roll_checked", False):
+        bot._ficha_roll_checked = True
+        bot.loop.create_task(_ficha_roll_startup_check())
     if not getattr(bot, "_scheduler_started", False):
         bot.loop.create_task(_session_scheduler_loop())
         bot._scheduler_started = True
@@ -54,7 +57,7 @@ import json
 from pathlib import Path as _Path
 
 # Toggleable features. A feature is ON unless a guild explicitly turns it off.
-FEATURES = ("roll", "mission", "countdown", "ficha")
+FEATURES = ("roll", "mission", "countdown", "ficha", "ficha_roll")  # ficha = /ficha_convite · ficha_roll = rolagens do site
 
 # Config is stored as JSON on a persistent path. On Railway, mount a volume and
 # point DATA_DIR at it (e.g. /data) so settings survive redeploys/restarts.
@@ -409,6 +412,16 @@ async def _cors_middleware(request: web.Request, handler):
         resp = web.Response(status=204)
     else:
         resp = await handler(request)
+    if request.path == FICHA_ROLL_PATH:
+        # rolagens da ficha: só o site (lista fechada) e com o header Authorization
+        origin = request.headers.get("Origin", "")
+        if origin in FICHA_ROLL_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Max-Age"] = "600"
+        resp.headers["Vary"] = "Origin"
+        return resp
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
@@ -421,6 +434,7 @@ async def _ensure_webhook_server():
         web.post("/webhook/rollmessage", _handle_rollmessage),
         web.post("/webhook/broadcast", _handle_broadcast),
         web.post("/webhook/preset", _handle_preset),
+        web.post(FICHA_ROLL_PATH, _handle_ficha_roll),
         web.route("OPTIONS", "/{tail:.*}", _handle_options),
     ])
     runner = web.AppRunner(app)
@@ -1413,6 +1427,419 @@ async def ficha_convite_slash(interaction: discord.Interaction, email: str):
         msg = "Algo correu mal com o convite. Fala com o Tiago."
     await interaction.followup.send(msg, ephemeral=True)
 
+# ---- Ficha Paranormal: rolagens da ficha → Discord ---------------------------
+# O site (ordemcodex.xyz) manda cada rolagem para POST /webhook/ficha-roll com o access token do Supabase do
+# jogador (Authorization: Bearer …). Sem segredo partilhado no browser: o bot confirma o token no Supabase
+# (/auth/v1/user) e que a conta está na lista de convidados (rpc ficha_paranormal.am_i_allowed), e só então posta
+# um embed no canal FICHA_ROLL_CHANNEL_ID. Por agora o canal é fixo; mais tarde escolhe-se por DM.
+import hashlib
+import base64
+from collections import deque
+
+FICHA_ROLL_PATH = "/webhook/ficha-roll"
+FICHA_ROLL_CHANNEL_ID = int(os.getenv("FICHA_ROLL_CHANNEL_ID", "1165819468354687066"))
+FICHA_ROLL_ORIGINS = frozenset(
+    o.strip().rstrip("/") for o in os.getenv(
+        "FICHA_ROLL_ORIGINS",
+        "https://ordemcodex.xyz,https://www.ordemcodex.xyz,"
+        "https://ficha-paranormal-preview-production.up.railway.app,http://localhost:5184",
+    ).split(",") if o.strip()
+)
+FICHA_ROLL_KINDS = ("atributo", "pericia", "ataque", "ritual", "livre")
+FICHA_ROLL_MAX_BODY = 4096       # bytes
+FICHA_ROLL_TEXT_MAX = 200        # chars por campo de texto (corta com "…")
+FICHA_ROLL_NUM_MAX = 1_000_000   # |número| máximo aceite
+FICHA_ROLL_AUTH_TTL = 300        # s — cache de tokens já confirmados
+FICHA_ROLL_RATE = (8, 10.0)      # 8 rolagens / 10 s por utilizador
+FICHA_ROLL_AUTH_RATE = (30, 60.0)  # 30 verificações novas no Supabase / 60 s por IP (cache miss)
+FICHA_ROLL_AUTH_GLOBAL_RATE = (120, 60.0)  # teto GLOBAL de verificações novas / 60 s (não depende de headers)
+FICHA_ROLL_AUTH_NEG_TTL = 60       # s — tokens recusados (401) ficam em cache negativa
+_JWT_RE = re.compile(r"^[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$")
+_CTRL_RE = re.compile("[\x00-\x1f\x7f\u200b-\u200f\u2028\u2029]+")
+
+
+class FichaRollError(ValueError):
+    """Payload inválido; a mensagem vai para o cliente em `detail`."""
+
+
+class SlidingWindowLimiter:
+    """No máximo `limit` eventos por `window` segundos por chave (janela deslizante — rajadas não passam)."""
+
+    def __init__(self, limit: int, window: float, max_keys: int = 5000):
+        self.limit, self.window, self.max_keys = limit, window, max_keys
+        self._hits: dict[str, deque] = {}
+
+    def hit(self, key: str, now: float | None = None) -> float:
+        """Regista um evento. Devolve 0 se permitido, senão os segundos até haver vaga (nada é registado)."""
+        now = time.monotonic() if now is None else now
+        q = self._hits.get(key)
+        if q is None:
+            if len(self._hits) >= self.max_keys:
+                self._prune(now)
+            q = self._hits[key] = deque()
+        while q and now - q[0] >= self.window:
+            q.popleft()
+        if len(q) >= self.limit:
+            return max(0.001, self.window - (now - q[0]))
+        q.append(now)
+        return 0.0
+
+    def _prune(self, now: float) -> None:
+        for k in [k for k, q in self._hits.items() if not q or now - q[-1] >= self.window]:
+            del self._hits[k]
+        if len(self._hits) >= self.max_keys:  # ainda cheio (ataque): começa do zero em vez de crescer
+            self._hits.clear()
+
+
+def _ficha_text(value, field: str, required: bool = False) -> str | None:
+    if value is None:
+        if required:
+            raise FichaRollError(f"{field} is required")
+        return None
+    if not isinstance(value, str):
+        raise FichaRollError(f"{field} must be a string")
+    text = " ".join(_CTRL_RE.sub(" ", value).split())  # uma linha só, sem caracteres de controlo
+    if not text:
+        if required:
+            raise FichaRollError(f"{field} must not be empty")
+        return None
+    if len(text) > FICHA_ROLL_TEXT_MAX:
+        text = text[: FICHA_ROLL_TEXT_MAX - 1].rstrip() + "…"
+    return text
+
+
+def _ficha_num(value, field: str, required: bool = False):
+    if value is None:
+        if required:
+            raise FichaRollError(f"{field} is required")
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FichaRollError(f"{field} must be a number")
+    if not math.isfinite(value) or abs(value) > FICHA_ROLL_NUM_MAX:
+        raise FichaRollError(f"{field} out of range")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return value
+
+
+def ficha_roll_validate(data) -> dict:
+    """Valida e normaliza o corpo do POST. Campos desconhecidos são ignorados. Levanta FichaRollError."""
+    if not isinstance(data, dict):
+        raise FichaRollError("body must be a JSON object")
+    kind = data.get("kind")
+    if kind not in FICHA_ROLL_KINDS:
+        raise FichaRollError(f"kind must be one of {list(FICHA_ROLL_KINDS)}")
+    out = {
+        "agent": _ficha_text(data.get("agent"), "agent", required=True),
+        "title": _ficha_text(data.get("title"), "title", required=True),
+        "kind": kind,
+        "notation": _ficha_text(data.get("notation"), "notation"),
+        "dice": _ficha_text(data.get("dice"), "dice"),
+        "total": _ficha_num(data.get("total"), "total"),
+        "attack": None,
+        "damage": None,
+        "extra": _ficha_text(data.get("extra"), "extra"),
+    }
+    attack = data.get("attack")
+    if attack is not None:
+        if not isinstance(attack, dict):
+            raise FichaRollError("attack must be an object")
+        critical = attack.get("critical", 0)
+        if critical is None:
+            critical = 0
+        if isinstance(critical, bool) or critical not in (-1, 0, 1):
+            raise FichaRollError("attack.critical must be -1, 0 or 1")
+        out["attack"] = {
+            "total": _ficha_num(attack.get("total"), "attack.total", required=True),
+            "critical": int(critical),
+            "info": _ficha_text(attack.get("info"), "attack.info"),
+        }
+    damage = data.get("damage")
+    if damage is not None:
+        if not isinstance(damage, dict):
+            raise FichaRollError("damage must be an object")
+        out["damage"] = {
+            "total": _ficha_num(damage.get("total"), "damage.total", required=True),
+            "breakdown": _ficha_text(damage.get("breakdown"), "damage.breakdown"),
+        }
+    if out["total"] is None and out["attack"] is None and out["damage"] is None:
+        raise FichaRollError("one of total, attack or damage is required")
+    return out
+
+
+def _fmt_num(n) -> str:
+    return str(n) if isinstance(n, int) else f"{n:.2f}".rstrip("0").rstrip(".")
+
+
+def ficha_roll_embed_parts(p: dict) -> dict:
+    """Texto do embed (puro, testável): {title, description, color}. Todo o texto do utilizador sai escapado."""
+    esc = discord.utils.escape_markdown
+    agent, title = p["agent"], p["title"]
+    head = f"🎲 {esc(agent)} — {esc(title)}"
+    if len(head) > 256:  # limite do Discord para o título do embed
+        head = head[:255] + "…"
+    lines: list[str] = []
+    dice_line = []
+    if p.get("notation"):
+        dice_line.append(f"`{p['notation'].replace('`', 'ˋ')}`")
+    if p.get("dice"):
+        dice_line.append(esc(p["dice"]))
+    if dice_line:
+        lines.append(" → ".join(dice_line))
+    if p.get("total") is not None:
+        lines.append(f"**Total: {_fmt_num(p['total'])}**")
+    color = 0x2B2D31
+    atk = p.get("attack")
+    if atk:
+        mark = {1: " 💥 **Crítico!**", -1: " 💀 **Falha crítica**"}.get(atk["critical"], "")
+        lines.append(f"**Ataque: {_fmt_num(atk['total'])}**{mark}")
+        if atk.get("info"):
+            lines.append(f"*{esc(atk['info'])}*")
+        color = {1: 0x2ECC71, -1: 0xE74C3C}.get(atk["critical"], color)
+    dmg = p.get("damage")
+    if dmg:
+        line = f"**Dano: {_fmt_num(dmg['total'])}**"
+        if dmg.get("breakdown"):
+            line += f" — {esc(dmg['breakdown'])}"
+        lines.append(line)
+    if p.get("extra"):
+        lines.append(esc(p["extra"]))
+    return {"title": head, "description": "\n".join(lines)[:4096], "color": color}
+
+
+def ficha_roll_embed(p: dict) -> discord.Embed:
+    parts = ficha_roll_embed_parts(p)
+    embed = discord.Embed(title=parts["title"], description=parts["description"], color=parts["color"])
+    embed.set_footer(text="ordemcodex.xyz")
+    return embed
+
+
+def _jwt_exp(token: str) -> float | None:
+    """`exp` do JWT, SEM verificar a assinatura — só serve para não guardar na cache além da validade."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None
+    except Exception:
+        return None
+
+
+def bearer_token(header: str | None) -> str | None:
+    if not header or not header.startswith("Bearer "):
+        return None
+    token = header[7:].strip()
+    if not token or len(token) > 4096 or not _JWT_RE.match(token):
+        return None
+    return token
+
+
+class FichaAuthError(Exception):
+    def __init__(self, status: int, code: str, retry_after: float = 0.0):
+        super().__init__(code)
+        self.status, self.code, self.retry_after = status, code, retry_after
+
+
+_ficha_auth_cache: dict[str, tuple[str, float]] = {}  # sha256(token) → (user_id, expira_em epoch)
+_ficha_auth_neg_cache: dict[str, float] = {}          # sha256(token) → expira_em epoch (token recusado, 401)
+_ficha_roll_limiter = SlidingWindowLimiter(*FICHA_ROLL_RATE)
+_ficha_auth_limiter = SlidingWindowLimiter(*FICHA_ROLL_AUTH_RATE)
+_ficha_auth_global_limiter = SlidingWindowLimiter(*FICHA_ROLL_AUTH_GLOBAL_RATE)
+_ficha_http: aiohttp.ClientSession | None = None
+_ficha_roll_channel = None
+
+
+def _ficha_http_session() -> aiohttp.ClientSession:
+    global _ficha_http
+    if _ficha_http is None or _ficha_http.closed:
+        _ficha_http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+    return _ficha_http
+
+
+async def _ficha_check_token(token: str) -> str:
+    """Devolve o user id do Supabase se o token é válido E a conta é convidada. Levanta FichaAuthError."""
+    headers = {"apikey": FICHA_SUPABASE_KEY, "Authorization": f"Bearer {token}"}
+    session = _ficha_http_session()
+
+    async def get_user():
+        async with session.get(f"{FICHA_SUPABASE_URL}/auth/v1/user", headers=headers) as r:
+            if r.status in (401, 403):
+                raise FichaAuthError(401, "unauthorized")
+            if r.status != 200:
+                raise FichaAuthError(503, "auth_unavailable")
+            body = await r.json(content_type=None)
+            uid = body.get("id") if isinstance(body, dict) else None
+            if not isinstance(uid, str) or not uid:
+                raise FichaAuthError(401, "unauthorized")
+            return uid
+
+    async def allowed():
+        async with session.post(
+            f"{FICHA_SUPABASE_URL}/rest/v1/rpc/am_i_allowed",
+            headers={**headers, "Content-Type": "application/json", "Content-Profile": "ficha_paranormal"},
+            json={},
+        ) as r:
+            if r.status in (401, 403):
+                raise FichaAuthError(401, "unauthorized")
+            if r.status != 200:
+                raise FichaAuthError(503, "auth_unavailable")
+            return (await r.json(content_type=None)) is True
+
+    try:
+        uid, ok = await asyncio.gather(get_user(), allowed())
+    except FichaAuthError:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        raise FichaAuthError(503, "auth_unavailable")
+    if not ok:
+        raise FichaAuthError(403, "not_allowed")
+    return uid
+
+
+def _bounded_put(cache: dict, key: str, value, now: float, expiry_of, max_size: int = 1000) -> None:
+    if len(cache) >= max_size:
+        for k in [k for k, v in cache.items() if expiry_of(v) <= now]:
+            del cache[k]
+        if len(cache) >= max_size:
+            cache.clear()
+    cache[key] = value
+
+
+async def _ficha_auth(token: str, client_key: str) -> str:
+    """Token → user id. Cache positiva (5 min) e negativa (401, 60 s); verificações novas no Supabase limitadas
+    por IP E por um teto global (o IP pode ser falsificado, o teto não)."""
+    key = hashlib.sha256(token.encode()).hexdigest()
+    now = time.time()
+    neg = _ficha_auth_neg_cache.get(key)
+    if neg is not None:
+        if neg > now:
+            raise FichaAuthError(401, "unauthorized")
+        del _ficha_auth_neg_cache[key]
+    cached = _ficha_auth_cache.get(key)
+    if cached and cached[1] > now:
+        return cached[0]
+    wait = _ficha_auth_limiter.hit(client_key) or _ficha_auth_global_limiter.hit("global")
+    if wait:
+        raise FichaAuthError(429, "rate_limited", retry_after=wait)
+    try:
+        uid = await _ficha_check_token(token)
+    except FichaAuthError as e:
+        if e.status == 401:
+            _bounded_put(_ficha_auth_neg_cache, key, now + FICHA_ROLL_AUTH_NEG_TTL, now, lambda v: v)
+        raise
+    expires = now + FICHA_ROLL_AUTH_TTL
+    exp = _jwt_exp(token)
+    if exp is not None:
+        expires = min(expires, exp)
+    if expires > now:
+        _bounded_put(_ficha_auth_cache, key, (uid, expires), now, lambda v: v[1])
+    return uid
+
+
+async def _read_limited(request: web.Request, limit: int) -> bytes | None:
+    """Lê o corpo até `limit` bytes; None se passar disso (mesmo sem Content-Length)."""
+    if request.content_length is not None and request.content_length > limit:
+        return None
+    buf = bytearray()
+    while True:
+        chunk = await request.content.read(limit + 1 - len(buf))
+        if not chunk:
+            return bytes(buf)
+        buf += chunk
+        if len(buf) > limit:
+            return None
+
+
+def _client_key(request: web.Request) -> str:
+    """IP do cliente para o limite por IP: X-Real-IP (posto pelo proxy do Railway) ou o hop MAIS À DIREITA do
+    X-Forwarded-For (o que o proxy acrescentou — o da esquerda é o que o cliente quiser). Mesmo assim pode ser
+    falsificável; por isso existe também o teto global em _ficha_auth."""
+    real = request.headers.get("X-Real-IP", "").strip()
+    if real:
+        return real[:64]
+    fwd = request.headers.get("X-Forwarded-For", "")
+    hops = [h.strip() for h in fwd.split(",") if h.strip()]
+    return (hops[-1][:64] if hops else "") or (request.remote or "?")
+
+
+def _reject_json_constant(name: str):
+    raise ValueError(f"{name} not allowed")  # NaN / Infinity
+
+
+def _json_err(status: int, code: str, **extra) -> web.Response:
+    return web.json_response({"ok": False, "error": code, **extra}, status=status)
+
+
+def _rate_limited(wait: float) -> web.Response:
+    retry = max(1, math.ceil(wait))  # segundos inteiros, no corpo e no header
+    resp = _json_err(429, "rate_limited", retry_after=retry)
+    resp.headers["Retry-After"] = str(retry)
+    return resp
+
+
+async def _handle_ficha_roll(request: web.Request) -> web.StreamResponse:
+    token = bearer_token(request.headers.get("Authorization"))
+    if token is None:
+        return _json_err(401, "unauthorized")
+    raw = await _read_limited(request, FICHA_ROLL_MAX_BODY)
+    if raw is None:
+        return _json_err(413, "payload_too_large")
+    try:
+        data = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+    except (ValueError, UnicodeDecodeError):
+        return _json_err(400, "invalid_json")
+    try:
+        payload = ficha_roll_validate(data)
+    except FichaRollError as e:
+        return _json_err(400, "invalid_payload", detail=str(e))
+    try:
+        uid = await _ficha_auth(token, _client_key(request))
+    except FichaAuthError as e:
+        if e.status == 429:
+            return _rate_limited(e.retry_after)
+        return _json_err(e.status, e.code)
+    wait = _ficha_roll_limiter.hit(uid)
+    if wait:
+        return _rate_limited(wait)
+
+    await ready_event.wait()
+    global _ficha_roll_channel
+    channel = _ficha_roll_channel or await _resolve_channel(FICHA_ROLL_CHANNEL_ID)
+    if channel is None:
+        return _json_err(503, "channel_unavailable")
+    _ficha_roll_channel = channel
+    guild = getattr(channel, "guild", None)
+    if guild is not None and not feature_enabled(guild.id, "ficha_roll"):
+        return _json_err(503, "disabled")
+    try:
+        msg = await channel.send(embed=ficha_roll_embed(payload), allowed_mentions=discord.AllowedMentions.none())
+    except (discord.NotFound, discord.Forbidden) as e:
+        _ficha_roll_channel = None  # canal apagado / sem permissão: volta a resolver no próximo pedido
+        logging.warning("ficha-roll: channel %s refused send (%s) — cache cleared", FICHA_ROLL_CHANNEL_ID, e.status)
+        return _json_err(502, "discord_error")
+    except discord.HTTPException as e:
+        logging.warning("ficha-roll: Discord send failed (%s)", e.status)
+        return _json_err(502, "discord_error")
+    logging.info("ficha-roll: user=%s kind=%s → msg %s", uid, payload["kind"], msg.id)
+    return web.json_response({"ok": True, "message_id": str(msg.id), "channel_id": str(channel.id)})
+
+
+async def _ficha_roll_startup_check() -> None:
+    """Só log: o canal das rolagens existe e o bot pode escrever lá? Nunca envia nada."""
+    channel = await _resolve_channel(FICHA_ROLL_CHANNEL_ID)
+    if channel is None:
+        logging.warning("ficha-roll: channel %s NOT accessible — rolls will fail (503)", FICHA_ROLL_CHANNEL_ID)
+        return
+    guild = getattr(channel, "guild", None)
+    if guild is None or guild.me is None:
+        logging.warning("ficha-roll: channel %s is not a guild channel", FICHA_ROLL_CHANNEL_ID)
+        return
+    perms = channel.permissions_for(guild.me)
+    level = logging.INFO if (perms.view_channel and perms.send_messages and perms.embed_links) else logging.WARNING
+    logging.log(level, "ficha-roll: channel #%s (%s) in %s — view=%s send_messages=%s embed_links=%s ficha_roll_enabled=%s",
+                getattr(channel, "name", "?"), channel.id, guild.name, perms.view_channel, perms.send_messages,
+                perms.embed_links, feature_enabled(guild.id, "ficha_roll"))
+
 # ---- ajuda / manual ---------------------------------------------------------
 # Compact Avrae-style command reference, grouped by category.
 AJUDA_TEXT = """# 📖 Manual do Bot
@@ -1526,7 +1953,7 @@ def _shutdown(*_):
     finally:
         sys.exit(0)
 
-signal.signal(signal.SIGTERM, _shutdown)
-signal.signal(signal.SIGINT, _shutdown)
-
-bot.run(TOKEN)
+if __name__ == "__main__":  # `python bot.py` (Procfile); importar o módulo (testes) não arranca o bot
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    bot.run(TOKEN)
