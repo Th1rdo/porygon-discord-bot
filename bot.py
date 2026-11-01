@@ -1445,7 +1445,17 @@ FICHA_ROLL_ORIGINS = frozenset(
         "https://ficha-paranormal-preview-production.up.railway.app,http://localhost:5184",
     ).split(",") if o.strip()
 )
-FICHA_ROLL_KINDS = ("atributo", "pericia", "ataque", "ritual", "livre")
+FICHA_ROLL_KINDS = ("atributo", "pericia", "ataque", "ritual", "livre", "op2")
+OP2_ROLES = ("atributo", "pericia", "bonus", "pavor")
+OP2_SIDES = (4, 6, 8, 10, 12, 20)
+OP2_MAX_DICE = 20                # rolagem normal: até 4 + pavor; dados livres (Dados, Lesão, Trauma) podem ter mais
+# Só o que depende dos dados. Passar ou falhar é com a mesa: o site não sabe a DT real, por isso não há veredito.
+OP2_OUTCOMES = {                 # resultado → (marca depois do total, cor do embed): as mesmas das rolagens de Ordem 1
+    "normal": ("", 0x2B2D31),
+    "critico": (" 💥 **Crítico!**", 0x2ECC71),
+    "falha-critica": (" 💀 **Falha crítica**", 0xE74C3C),
+}
+OP2_PERFIS = ("vigilante", "executor", "analista")
 FICHA_ROLL_MAX_BODY = 4096       # bytes
 FICHA_ROLL_TEXT_MAX = 200        # chars por campo de texto (corta com "…")
 FICHA_ROLL_NUM_MAX = 1_000_000   # |número| máximo aceite
@@ -1522,6 +1532,79 @@ def _ficha_num(value, field: str, required: bool = False):
     return value
 
 
+def _ficha_flag(value, field: str) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise FichaRollError(f"{field} must be a boolean")
+    return value
+
+
+def _ficha_damage(damage) -> dict | None:
+    if damage is None:
+        return None
+    if not isinstance(damage, dict):
+        raise FichaRollError("damage must be an object")
+    return {
+        "total": _ficha_num(damage.get("total"), "damage.total", required=True),
+        "breakdown": _ficha_text(damage.get("breakdown"), "damage.breakdown"),
+    }
+
+
+def _op2_die(die, i: int) -> dict:
+    field = f"dice[{i}]"
+    if not isinstance(die, dict):
+        raise FichaRollError(f"{field} must be an object")
+    role = die.get("role")
+    if role not in OP2_ROLES:
+        raise FichaRollError(f"{field}.role must be one of {list(OP2_ROLES)}")
+    sides = _ficha_num(die.get("sides"), f"{field}.sides", required=True)
+    if sides not in OP2_SIDES:
+        raise FichaRollError(f"{field}.sides must be one of {list(OP2_SIDES)}")
+    value = _ficha_num(die.get("value"), f"{field}.value", required=True)
+    if not isinstance(value, int) or not 1 <= value <= sides:
+        raise FichaRollError(f"{field}.value must be a whole number from 1 to {sides}")
+    return {
+        "role": role,
+        "sides": sides,
+        "value": value,
+        "cancelled": _ficha_flag(die.get("cancelled"), f"{field}.cancelled"),
+        "dropped": _ficha_flag(die.get("dropped"), f"{field}.dropped"),
+        "label": _ficha_text(die.get("label"), f"{field}.label"),
+    }
+
+
+def _op2_validate(data: dict) -> dict:
+    """Rolagem da ficha de Ordem 2: dados com papel e tamanho, em vez do texto livre dos outros kinds."""
+    dice = data.get("dice")
+    if not isinstance(dice, list) or not dice:
+        raise FichaRollError("dice must be a non-empty array")
+    if len(dice) > OP2_MAX_DICE:
+        raise FichaRollError(f"dice must have at most {OP2_MAX_DICE} entries")
+    outcome = data.get("outcome")
+    if not isinstance(outcome, str) or outcome not in OP2_OUTCOMES:
+        raise FichaRollError(f"outcome must be one of {list(OP2_OUTCOMES)}")
+    perfil = data.get("perfil")
+    if perfil is not None and (not isinstance(perfil, str) or perfil not in OP2_PERFIS):
+        raise FichaRollError(f"perfil must be one of {list(OP2_PERFIS)}")
+    # Dados livres (só bônus): não são um teste de perícia + atributo, então RA e RB não se aplicam.
+    free = all(isinstance(d, dict) and d.get("role") == "bonus" for d in dice)
+    return {
+        "agent": _ficha_text(data.get("agent"), "agent", required=True),
+        "title": _ficha_text(data.get("title"), "title", required=True),
+        "kind": "op2",
+        "perfil": perfil,
+        "dice": [_op2_die(d, i) for i, d in enumerate(dice)],
+        "total": _ficha_num(data.get("total"), "total", required=True),
+        "ra": _ficha_num(data.get("ra"), "ra", required=free is False),
+        "rb": _ficha_num(data.get("rb"), "rb", required=free is False),
+        "outcome": outcome,
+        "damage": _ficha_damage(data.get("damage")),
+        "extra": _ficha_text(data.get("extra"), "extra"),
+        "followUp": _ficha_text(data.get("followUp"), "followUp"),
+    }
+
+
 def ficha_roll_validate(data) -> dict:
     """Valida e normaliza o corpo do POST. Campos desconhecidos são ignorados. Levanta FichaRollError."""
     if not isinstance(data, dict):
@@ -1529,6 +1612,8 @@ def ficha_roll_validate(data) -> dict:
     kind = data.get("kind")
     if kind not in FICHA_ROLL_KINDS:
         raise FichaRollError(f"kind must be one of {list(FICHA_ROLL_KINDS)}")
+    if kind == "op2":
+        return _op2_validate(data)
     out = {
         "agent": _ficha_text(data.get("agent"), "agent", required=True),
         "title": _ficha_text(data.get("title"), "title", required=True),
@@ -1554,14 +1639,7 @@ def ficha_roll_validate(data) -> dict:
             "critical": int(critical),
             "info": _ficha_text(attack.get("info"), "attack.info"),
         }
-    damage = data.get("damage")
-    if damage is not None:
-        if not isinstance(damage, dict):
-            raise FichaRollError("damage must be an object")
-        out["damage"] = {
-            "total": _ficha_num(damage.get("total"), "damage.total", required=True),
-            "breakdown": _ficha_text(damage.get("breakdown"), "damage.breakdown"),
-        }
+    out["damage"] = _ficha_damage(data.get("damage"))
     if out["total"] is None and out["attack"] is None and out["damage"] is None:
         raise FichaRollError("one of total, attack or damage is required")
     return out
@@ -1571,8 +1649,60 @@ def _fmt_num(n) -> str:
     return str(n) if isinstance(n, int) else f"{n:.2f}".rstrip("0").rstrip(".")
 
 
+def _op2_shown_dice(dice: list[dict]) -> list[dict]:
+    """Ordem de leitura: perícia, atributo, bônus, pavor. Os rótulos seguem a mesma ordem, para baterem com os dados."""
+    order = ("pericia", "atributo", "bonus", "pavor")
+    return sorted(dice, key=lambda d: order.index(d["role"]))
+
+
+def _op2_values(dice: list[dict]) -> str:
+    """[7, 3]; dado cancelado (pavor) ou descartado (limite de 3 somados) sai riscado, como nas rolagens de Ordem 1."""
+    shown = (f"~~{d['value']}~~" if d["cancelled"] or d["dropped"] else str(d["value"]) for d in dice)
+    return f"[{', '.join(shown)}]"
+
+
+def _op2_embed_parts(p: dict) -> dict:
+    """Igual às rolagens de Ordem 1 (Tiago, 2026-11-01): notação → dados, total, dano. Sem rodapé; RA e RB à parte."""
+    esc = discord.utils.escape_markdown
+    mark, color = OP2_OUTCOMES[p["outcome"]]
+    head = f"🎲 {esc(p['agent'])} - {esc(p['title'])}"
+    if len(head) > 256:  # limite do Discord para o título do embed
+        head = head[:255] + "…"
+    dice = _op2_shown_dice(p["dice"])
+    summed = [d for d in dice if d["role"] != "pavor"]
+    fear = [d for d in dice if d["role"] == "pavor"]
+    notation = "+".join(f"d{d['sides']}" for d in summed)
+    rolled = " → ".join(g for g in (f"`{notation}`" if notation else "", _op2_values(summed) if summed else "") if g)
+    if fear:
+        rolled = " · ".join(g for g in (rolled, f"pavor `d{fear[0]['sides']}` → {fear[0]['value']}") if g)
+    free = all(d["role"] == "bonus" for d in dice)
+    tally = "" if free else f"RA {_fmt_num(p['ra'])} · RB {_fmt_num(p['rb'])}"
+    lines = []
+    if p.get("followUp"):
+        lines.append(f"*{esc(p['followUp'])}*")
+    dmg = p.get("damage")
+    if dmg:  # ataque: como em Ordem 1, "Ataque" no lugar de "Total", com as perícias e os dados em itálico
+        lines.append(f"**Ataque: {_fmt_num(p['total'])}**{mark}")
+        labels = " + ".join(esc(d["label"]) for d in dice if d["label"])
+        lines.append(" · ".join(g for g in (labels, rolled, tally) if g))
+        line = f"**Dano: {_fmt_num(dmg['total'])}**"
+        if dmg.get("breakdown"):
+            line += f" — {esc(dmg['breakdown'])}"
+        lines.append(line)
+    else:
+        lines.append(rolled)
+        lines.append(f"**Total: {_fmt_num(p['total'])}**{mark}")
+        if tally:
+            lines.append(tally)
+    if p.get("extra"):
+        lines.append(esc(p["extra"]))
+    return {"title": head, "description": "\n".join(lines)[:4096], "color": color, "footer": None}
+
+
 def ficha_roll_embed_parts(p: dict) -> dict:
     """Texto do embed (puro, testável): {title, description, color}. Todo o texto do utilizador sai escapado."""
+    if p.get("kind") == "op2":
+        return _op2_embed_parts(p)
     esc = discord.utils.escape_markdown
     agent, title = p["agent"], p["title"]
     head = f"🎲 {esc(agent)} — {esc(title)}"
@@ -1610,7 +1740,9 @@ def ficha_roll_embed_parts(p: dict) -> dict:
 def ficha_roll_embed(p: dict) -> discord.Embed:
     parts = ficha_roll_embed_parts(p)
     embed = discord.Embed(title=parts["title"], description=parts["description"], color=parts["color"])
-    embed.set_footer(text="ordemcodex.xyz")
+    footer = parts.get("footer", "ordemcodex.xyz")  # OP2 não tem rodapé (Tiago, 2026-11-01); os outros tipos continuam iguais
+    if footer:
+        embed.set_footer(text=footer)
     return embed
 
 

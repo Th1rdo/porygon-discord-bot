@@ -126,6 +126,178 @@ def test_embed_title_capped_and_floats():
     assert emb.footer.text == "ordemcodex.xyz"
 
 
+# ---- kind "op2" -----------------------------------------------------------------------------------------------
+OP2 = {"kind": "op2", "agent": "Rowan", "title": "Pontaria",
+       "dice": [{"role": "pericia", "sides": 10, "value": 7}, {"role": "atributo", "sides": 8, "value": 3}],
+       "total": 10, "ra": 7, "rb": 3, "outcome": "normal"}
+
+
+def op2_parts(**over):
+    return B.ficha_roll_embed_parts(B.ficha_roll_validate({**OP2, **over}))
+
+
+def die(role="atributo", sides=8, value=3, **over):
+    return {"role": role, "sides": sides, "value": value, **over}
+
+
+def test_op2_validate_minimal_ok():
+    p = B.ficha_roll_validate({**OP2, "unknown": "ignored"})
+    assert p["kind"] == "op2" and p["agent"] == "Rowan" and "unknown" not in p
+    assert p["dice"][0] == {"role": "pericia", "sides": 10, "value": 7, "cancelled": False, "dropped": False, "label": None}
+    assert p["perfil"] is None
+    assert (p["total"], p["ra"], p["rb"], p["outcome"]) == (10, 7, 3, "normal")
+    assert "dt" not in p and "dt" not in B.ficha_roll_validate({**OP2, "dt": 7})
+    assert p["damage"] is None and p["extra"] is None and p["followUp"] is None
+
+
+def test_op2_validate_accepts_every_size_role_and_outcome():
+    for sides in (4, 6, 8, 10, 12, 20):
+        for value in (1, sides):
+            assert B.ficha_roll_validate({**OP2, "dice": [die(sides=sides, value=value)]})["dice"][0]["value"] == value
+    for role in ("atributo", "pericia", "bonus", "pavor"):
+        assert B.ficha_roll_validate({**OP2, "dice": [die(role=role)]})["dice"][0]["role"] == role
+    for outcome in ("normal", "critico", "falha-critica"):
+        assert B.ficha_roll_validate({**OP2, "outcome": outcome})["outcome"] == outcome
+    assert len(B.ficha_roll_validate({**OP2, "dice": [die()] * 5})["dice"]) == 5
+    d = B.ficha_roll_validate({**OP2, "dice": [die(sides=8.0, value=3.0, cancelled=True, dropped=None)]})["dice"][0]
+    assert d["sides"] == 8 and isinstance(d["sides"], int) and d["value"] == 3 and isinstance(d["value"], int)
+    assert d["cancelled"] is True and d["dropped"] is False
+
+
+def test_op2_validate_rejects_bad_payloads():
+    expect_error({**OP2, "agent": None}, "agent is required")
+    expect_error({**OP2, "title": 5}, "title must be a string")
+    expect_error({**OP2, "dice": "[7, 3]"}, "dice must be a non-empty array")
+    expect_error({**OP2, "dice": []}, "dice must be a non-empty array")
+    expect_error({**OP2, "dice": None}, "dice must be a non-empty array")
+    expect_error({**OP2, "dice": [die()] * 21}, "at most 20")
+    expect_error({**OP2, "dice": [7]}, "dice[0] must be an object")
+    expect_error({**OP2, "dice": [die(role="sorte")]}, "dice[0].role")
+    expect_error({**OP2, "dice": [die(role=["pavor"])]}, "dice[0].role")
+    expect_error({**OP2, "dice": [die(sides=7)]}, "dice[0].sides must be one of")
+    expect_error({**OP2, "dice": [die(sides=True)]}, "dice[0].sides must be a number")
+    expect_error({**OP2, "dice": [die(sides=None)]}, "dice[0].sides is required")
+    expect_error({**OP2, "dice": [die(sides=8, value=9)]}, "dice[0].value must be a whole number from 1 to 8")
+    expect_error({**OP2, "dice": [die(value=0)]}, "dice[0].value")
+    expect_error({**OP2, "dice": [die(value=2.5)]}, "dice[0].value")
+    expect_error({**OP2, "dice": [die(value="3")]}, "dice[0].value must be a number")
+    expect_error({**OP2, "dice": [die(), die(cancelled=1)]}, "dice[1].cancelled must be a boolean")
+    expect_error({**OP2, "dice": [die(dropped="sim")]}, "dice[0].dropped must be a boolean")
+    for field in ("total", "ra", "rb"):
+        expect_error({k: v for k, v in OP2.items() if k != field}, f"{field} is required")
+        expect_error({**OP2, field: True}, f"{field} must be a number")
+        expect_error({**OP2, field: 10**9}, "out of range")
+    expect_error({k: v for k, v in OP2.items() if k != "outcome"}, "outcome must be")
+    for old in ("sucesso", "falha", "quase"):
+        expect_error({**OP2, "outcome": old}, "outcome must be")
+    expect_error({**OP2, "outcome": ["falha"]}, "outcome must be")
+    expect_error({**OP2, "damage": []}, "damage must be an object")
+    expect_error({**OP2, "damage": {"breakdown": "x"}}, "damage.total is required")
+    expect_error({**OP2, "extra": 5}, "extra must be a string")
+    expect_error({**OP2, "followUp": True}, "followUp must be a string")
+    expect_error({**OP2, "dice": [die(label=5)]}, "dice[0].label must be a string")
+    expect_error({**OP2, "perfil": "ladino"}, "perfil must be one of")
+    expect_error({**OP2, "perfil": ["analista"]}, "perfil must be one of")
+    expect_error({**OP2, "perfil": 1}, "perfil must be one of")
+
+
+def test_other_kinds_keep_their_shape_next_to_op2():
+    # dice continua a ser texto nos kinds antigos, e o array do op2 não entra por lá
+    expect_error({**BASE, "dice": [die()]}, "dice must be a string")
+    p = B.ficha_roll_validate(BASE)
+    assert set(p) == {"agent", "title", "kind", "notation", "dice", "total", "attack", "damage", "extra"}
+    assert B.ficha_roll_embed(p).footer.text == "ordemcodex.xyz"
+
+
+ANIMAIS = {"kind": "op2", "agent": "Rowan", "title": "Animais", "total": 6, "ra": 3, "rb": 3, "outcome": "normal",
+           "dice": [die("atributo", 6, 3, label="Emoção"), die("pericia", 6, 3, label="Animais")]}
+
+
+def op2_lines(**over):
+    return B.ficha_roll_embed_parts(B.ficha_roll_validate({**ANIMAIS, **over}))["description"].split("\n")
+
+
+def test_op2_embed_exact_shape_matches_ordem_1():
+    p = B.ficha_roll_validate(ANIMAIS)
+    e = B.ficha_roll_embed_parts(p)
+    assert e["title"] == "🎲 Rowan - Animais"
+    assert e["description"] == "`d6+d6` → [3, 3]\n**Total: 6**\nRA 3 · RB 3"
+    emb = B.ficha_roll_embed(p)
+    assert not emb.footer.text and emb.description == e["description"]
+    assert e["color"] == 0x2B2D31
+
+
+def test_op2_embed_has_no_verdict_or_dt():
+    text = "\n".join(op2_lines())
+    for verdict in ("Sucesso", "Falha", "DT", "✅", "❌"):
+        assert verdict not in text
+
+
+def test_op2_embed_crit_and_fumble_marks_and_colours():
+    assert op2_lines(outcome="critico")[1] == "**Total: 6** 💥 **Crítico!**"
+    assert op2_lines(outcome="falha-critica", total=0)[1] == "**Total: 0** 💀 **Falha crítica**"
+    colour = lambda **o: B.ficha_roll_embed_parts(B.ficha_roll_validate({**ANIMAIS, **o}))["color"]
+    assert colour(outcome="critico") == 0x2ECC71 and colour(outcome="falha-critica") == 0xE74C3C
+    assert colour(perfil="executor") == 0x2B2D31
+
+
+def test_op2_embed_bonus_fear_and_struck_dice():
+    lines = op2_lines(dice=[die("pavor", 8, 5), die("bonus", 6, 4), die("atributo", 8, 3, cancelled=True),
+                            die("bonus", 6, 1, dropped=True), die("pericia", 10, 7)])
+    assert lines[0] == "`d10+d8+d6+d6` → [7, ~~3~~, 4, ~~1~~] · pavor `d8` → 5"
+    assert op2_lines(dice=[die("pavor", 6, 1)])[0] == "pavor `d6` → 1"
+    assert op2_lines(dice=[die("bonus", 6, 2)])[0] == "`d6` → [2]"
+
+
+def test_op2_embed_attack_shape_and_followup_and_extra():
+    dice = [die("pericia", 10, 7, label="Pontaria"), die("atributo", 8, 3, label="Físico")]
+    lines = op2_lines(title="Arco curto", dice=dice, total=10, ra=7, rb=3, damage={"total": 8, "breakdown": "RA 7 + 1"})
+    assert lines == ["**Ataque: 10**", "Pontaria + Físico · `d10+d8` → [7, 3] · RA 7 · RB 3", "**Dano: 8** — RA 7 + 1"]
+    assert op2_lines(damage={"total": 8}, outcome="critico")[0] == "**Ataque: 6** 💥 **Crítico!**"
+    assert op2_lines(damage={"total": 8})[-1] == "**Dano: 8**"
+    assert op2_lines(extra="O dado de pavor acabou")[-1] == "O dado de pavor acabou"
+    follow = op2_lines(followUp="Análise: d8 3→4", total=7, rb=4)
+    assert follow[0] == "*Análise: d8 3→4*" and follow[2] == "**Total: 7**" and follow[3] == "RA 3 · RB 4"
+
+
+def test_op2_free_dice_have_no_ra_rb_and_allow_large_pools():
+    dice = [die("bonus", 6, 2)] * 12 + [die("bonus", 20, 7)]
+    p = {**ANIMAIS, "title": "Dados", "dice": dice, "total": 31}
+    p.pop("ra"), p.pop("rb")
+    lines = B.ficha_roll_embed_parts(B.ficha_roll_validate(p))["description"].split("\n")
+    assert lines[1] == "**Total: 31**" and len(lines) == 2
+    assert lines[0].startswith("`d6+d6+") and lines[0].endswith("2, 7]")
+    # teste normal continua exigindo RA e RB
+    bad = dict(ANIMAIS); bad.pop("ra")
+    try:
+        B.ficha_roll_validate(bad)
+    except B.FichaRollError:
+        pass
+    else:
+        raise AssertionError("ra deveria ser obrigatório num teste")
+
+
+def test_op2_embed_escapes_user_text():
+    e = B.ficha_roll_embed_parts(B.ficha_roll_validate({
+        **ANIMAIS, "agent": "**Bold** @everyone", "title": "_x_", "extra": "# título [link](http://evil)",
+        "followUp": "||spoiler||", "damage": {"total": 1, "breakdown": "`code`"},
+        "dice": [die("pericia", label="~~a~~\n# b")]}))
+    assert e["title"].startswith("🎲 \\*\\*Bold\\*\\* @everyone - \\_x\\_")
+    d = e["description"]
+    assert "\\|\\|spoiler\\|\\|" in d and "\\`code\\`" in d and "\\[link]" in d and "\\~\\~a\\~\\~" in d
+    # uma só linha por campo: texto do jogador nunca abre linha própria
+    assert len(d.split("\n")) == 5
+
+
+def test_op2_largest_payload_fits_the_body_limit_and_embed():
+    p = {**OP2, "agent": "a" * 200, "title": "b" * 200, "extra": "c" * 200, "followUp": "d" * 200,
+         "damage": {"total": 1000, "breakdown": "e" * 200}, "perfil": "analista",
+         "dice": [die(cancelled=True, dropped=True, label="f" * 200)] * 5}
+    assert len(json.dumps(p).encode()) <= B.FICHA_ROLL_MAX_BODY
+    e = B.ficha_roll_embed_parts(B.ficha_roll_validate(p))
+    assert len(e["description"]) <= 4096
+
+
 # ---- rate limiter ---------------------------------------------------------------------------------------------
 def test_limiter_sliding_window():
     lim = B.SlidingWindowLimiter(8, 10.0)
@@ -299,6 +471,18 @@ async def _run_handler_tests():
             r = await client.post(B.FICHA_ROLL_PATH, json=BASE, headers=H("a.b.bad"))
             assert r.status == 401
         assert calls["n"] == n0 + 1
+
+        # kind op2 pelo mesmo caminho: embed próprio; payload inválido nunca chega ao canal
+        reset()
+        n_sent = len(fake.sent)
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "dice": [die(value=99)]}, headers=H())
+        body = await r.json()
+        assert r.status == 400 and body["error"] == "invalid_payload" and "dice[0].value" in body["detail"]
+        assert len(fake.sent) == n_sent
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=H())
+        assert r.status == 200 and len(fake.sent) == n_sent + 1
+        assert fake.sent[-1]["embed"].title == "🎲 Rowan - Pontaria"
+        assert not fake.sent[-1]["embed"].footer.text
 
         # M1: rotating X-Forwarded-For (spoofed IP per request) still hits the GLOBAL ceiling
         reset()
