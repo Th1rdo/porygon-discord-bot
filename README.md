@@ -135,6 +135,8 @@ Qualquer pessoa no servidor pode liberar **o seu** e-mail no site da ficha ([ord
 | Comando | Descrição |
 |---|---|
 | `/ficha_convite <email>` | Põe o e-mail na lista de convidados. Resposta **só para quem usou** (ephemeral). Um e-mail por conta do Discord |
+| `/ficha_ligar <codigo>` | Liga uma ficha do site a este canal (o código aparece na ficha, em **Ligar a um canal**). Ver [Ligar a ficha a um canal](#ligar-a-ficha-a-um-canal-ficha_ligar) |
+| `/ficha_canal_padrao [canal]` | 🔒 Dono do bot: canal das fichas que não estão ligadas a nenhum |
 
 Como funciona: o bot chama a função `ficha_paranormal.invite_from_discord` no Supabase do site (projeto hub
 `zktdrataxwkfrdjdkrsl`) com a chave *publishable* (pública). A função só sabe **acrescentar** convites, confere o
@@ -154,8 +156,9 @@ encode(extensions.digest('<novo>', 'sha256'), 'hex') where name = 'discord_bot';
 ### 🎲 Rolagens da ficha → Discord
 
 Quando um jogador rola algo na ficha ([ordemcodex.xyz](https://ordemcodex.xyz)), o site manda a rolagem ao bot e o
-bot publica um embed compacto no canal `FICHA_ROLL_CHANNEL_ID` (por agora fixo: `1165819468354687066`; mais tarde
-escolhe-se por DM). **Não há segredo no browser**: o site envia o *access token* do Supabase do jogador e o bot
+bot publica um embed compacto no **canal ligado àquela ficha** (ver [Ligar a ficha a um canal](#ligar-a-ficha-a-um-canal-ficha_ligar)),
+ou, se a ficha não está ligada, no canal padrão (`/ficha_canal_padrao`, só o dono do bot) ou em `FICHA_ROLL_CHANNEL_ID`.
+**Não há segredo no browser**: o site envia o *access token* do Supabase do jogador e o bot
 confirma-o no servidor.
 
 **`POST /webhook/ficha-roll`**
@@ -174,7 +177,8 @@ Content-Type: application/json
   "total": 23,                     // número (opcional se houver attack/damage)
   "attack": { "total": 25, "critical": 1, "info": "margem 19" },   // opcional; critical: -1 falha, 0, 1 crítico
   "damage": { "total": 14, "breakdown": "1d8+3 [5] +6" },          // opcional
-  "extra": "texto livre"           // opcional
+  "extra": "texto livre",          // opcional
+  "sheet": "<uuid da ficha>"       // opcional — escolhe o canal ligado a esta ficha (campo antigo `channel` é ignorado)
 }
 ```
 
@@ -192,6 +196,7 @@ Respostas (JSON):
 | `403` | `{"ok": false, "error": "not_allowed"}` | Conta válida mas fora da lista de convidados |
 | `413` | `{"ok": false, "error": "payload_too_large"}` | Corpo > 4 KB |
 | `429` | `{"ok": false, "error": "rate_limited", "retry_after": <segundos inteiros>}` + header `Retry-After` (mesmo valor) | > 8 rolagens / 10 s por conta; ou verificações de token novas acima de 30 / min por IP **ou** 120 / min no total |
+| `403` | `{"ok": false, "error": "channel_not_allowed"}` | A ficha está ligada a um canal onde quem a ligou (ou o bot) já não pode escrever — nada é publicado |
 | `502` | `{"ok": false, "error": "discord_error"}` | O Discord recusou o envio |
 | `503` | `{"ok": false, "error": "auth_unavailable" \| "channel_unavailable" \| "disabled"}` | Supabase em baixo / canal inacessível / `ficha_roll` desligada no servidor do canal |
 
@@ -210,6 +215,30 @@ existe e se tem `send_messages` / `embed_links` (procura `ficha-roll:` nos logs)
 Desligar só as rolagens: `/config disable ficha_roll` no servidor do canal (responde `503 disabled`); a função
 `ficha` (convites) é independente. Se o envio falhar com *Forbidden*/*Not Found*, o bot esquece o canal em cache e
 volta a resolvê-lo no pedido seguinte (repor a permissão/canal não precisa de restart).
+
+#### Ligar a ficha a um canal (`/ficha_ligar`)
+
+Cada ficha rola no canal da sua mesa. Na ficha, **Ligar a um canal** pede um código ao bot; no canal da mesa, quem
+joga envia `/ficha_ligar codigo:XXXXXX`. O bot confirma que essa pessoa e o próprio bot podem escrever ali, guarda a
+ligação e responde **no canal** (público, sem pingar ninguém) qual personagem passou a rolar ali. Os erros são só
+para quem correu o comando.
+
+- Código: 6 caracteres sem I/O/0/1, vale **10 min**, serve uma vez, só em memória (um restart apaga os pendentes).
+  Um código novo para a mesma ficha substitui o anterior. No máximo 10 pendentes por conta e 2000 no total.
+- Códigos errados: 5 / 60 s por pessoa no Discord.
+- Ligações em `guild_config.json` → `ficha_roll.sheets[<uid do Supabase>][<uuid da ficha>] = {channel, guild, by, at}`
+  (máx. 100 por conta). A cada rolagem o bot verifica de novo se `by` e o bot ainda podem escrever no canal; se não,
+  `403 channel_not_allowed`. Falha passageira do Discord → `503 channel_unavailable`.
+- Desligar: na própria ficha (**Desligar**).
+
+**`POST /webhook/ficha-link`** — mesmo Bearer, mesmas origens, corpo ≤ 1 KB, 30 pedidos / 60 s por conta.
+Corpo `{"action": "code" | "status" | "unlink", "sheet": "<uuid>", "name"?: "<personagem>"}`:
+
+| `action` | Resposta `200` |
+|---|---|
+| `code` | `{"ok": true, "code": "7KQ2M9", "expires_in": 600}` (`503 busy` se há códigos demais) |
+| `status` | `{"ok": true, "linked": {id, name, guild, usable} \| null, "pending": bool, "default": {id, name, guild} \| null}` |
+| `unlink` | igual a `status`, com `linked: null` |
 
 Variáveis: `FICHA_ROLL_CHANNEL_ID` (default `1165819468354687066`), `FICHA_ROLL_ORIGINS` (opcional — substitui a
 lista de origens, separadas por vírgula), mais `FICHA_SUPABASE_URL` / `FICHA_SUPABASE_KEY` (as mesmas do convite).
@@ -255,6 +284,7 @@ Servidor aiohttp na porta `PORT` (default 8080) para disparar rolls de fora do D
 | `POST /webhook/rollmessage` | `{"token", "channel_id", "expression", "message"}` | Roll com cabeçalho |
 | `POST /webhook/broadcast` | `{"token", "channel_ids": [..], "content"}` | Envia a mesma mensagem a vários canais (máx. 10, conteúdo ≤2000 chars) |
 | `POST /webhook/ficha-roll` | ver [Rolagens da ficha](#-rolagens-da-ficha--discord) | Rolagem vinda da ficha; auth = token Supabase do jogador (sem `token`) |
+| `POST /webhook/ficha-link` | ver [Ligar a ficha a um canal](#ligar-a-ficha-a-um-canal-ficha_ligar) | Código, estado e desligar da ligação ficha → canal; mesmo auth |
 | `POST /webhook/preset` | `{"token", "preset", "target"?}` | Envia uma mensagem **hardcoded** (`BROADCAST_PRESETS` no `bot.py`) aos canais do target (`BROADCAST_CHANNELS`). `target` é `"test"` (default) ou `"prod"` — usado pelos botões do site. Presets atuais: `reconstrucao` |
 
 O `token` tem de bater com a env var `WEBHOOK_TOKEN` (ou `WEBHOOK_SECRET`); o `/broadcast` **recusa** pedidos se nenhuma estiver definida. As respostas têm CORS aberto para chamadas de browser (exceto `/webhook/ficha-roll`, que só aceita as origens do site). URL pública: `https://porygon-discord-bot-production.up.railway.app`.

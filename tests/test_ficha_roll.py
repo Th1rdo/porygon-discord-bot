@@ -205,7 +205,7 @@ def test_other_kinds_keep_their_shape_next_to_op2():
     # dice continua a ser texto nos kinds antigos, e o array do op2 não entra por lá
     expect_error({**BASE, "dice": [die()]}, "dice must be a string")
     p = B.ficha_roll_validate(BASE)
-    assert set(p) == {"agent", "title", "kind", "notation", "dice", "total", "attack", "damage", "extra", "channel"}
+    assert set(p) == {"agent", "title", "kind", "notation", "dice", "total", "attack", "damage", "extra", "sheet"}
     assert B.ficha_roll_embed(p).footer.text == "ordemcodex.xyz"
 
 
@@ -342,6 +342,198 @@ def test_client_key_ignores_spoofable_left_hop():
     assert B._client_key(req({"X-Forwarded-For": " , "})) != ""
 
 
+# ---- /ficha_ligar (ficha_link_consume) ------------------------------------------------------------------------
+SHEET = "0f8e2b7a-1c3d-4e5f-9a8b-7c6d5e4f3a21"
+SHEET2 = "11111111-2222-4333-8444-555555555555"
+
+
+def _perms(ok=True):
+    return types.SimpleNamespace(view_channel=True, send_messages=ok, send_messages_in_threads=ok, embed_links=True)
+
+
+def _link_channel(cid=777, guild_id=1, member_ok=True, bot_ok=True, ctype=discord.ChannelType.text):
+    class Ch:
+        id, type, guild, mention = cid, ctype, types.SimpleNamespace(id=guild_id, name="AKRASIA"), f"<#{cid}>"
+
+        def permissions_for(self, who):
+            return _perms(bot_ok if who == "me" else member_ok)
+    return Ch()
+
+
+class _LinkState:
+    """Isola códigos, ligações, limites e o guardar do config num teste."""
+
+    def __enter__(self):
+        self.saved = (B._config.pop("ficha_roll", None), B._save_config, dict(B._ficha_link_codes))
+        B._save_config = lambda: None
+        B._ficha_link_codes.clear()
+        B._ficha_link_fail_limiter._hits.clear()
+        return self
+
+    def __exit__(self, *exc):
+        cfg, B._save_config, codes = self.saved
+        B._config.pop("ficha_roll", None)
+        if cfg is not None:
+            B._config["ficha_roll"] = cfg
+        B._ficha_link_codes.clear()
+        B._ficha_link_codes.update(codes)
+        B._ficha_link_fail_limiter._hits.clear()
+
+
+def test_link_code_shape_replacement_and_expiry():
+    with _LinkState():
+        user = types.SimpleNamespace(id=555, mention="<@555>")
+        c1 = B.ficha_link_new_code("u1", SHEET, "Rowan")
+        c2 = B.ficha_link_new_code("u1", SHEET, "Rowan")
+        other = B.ficha_link_new_code("u1", SHEET2, None)
+        assert c1 not in B._ficha_link_codes and {c2, other} <= set(B._ficha_link_codes), "código novo substitui o antigo"
+        assert B.ficha_link_pending("u1", SHEET) and not B.ficha_link_pending("u2", SHEET)
+        ok, text = B.ficha_link_consume(c1, _link_channel(), user, "me")
+        assert not ok and text == B.FICHA_LINK_TEXT["unknown_code"]
+        # expirado: recusado e apagado
+        B._ficha_link_codes[c2]["expires"] = B.time.time() - 1
+        assert not B.ficha_link_pending("u1", SHEET)
+        ok, text = B.ficha_link_consume(c2, _link_channel(), user, "me")
+        assert not ok and text == B.FICHA_LINK_TEXT["unknown_code"] and c2 not in B._ficha_link_codes
+        # expirados saem ao criar o próximo
+        B._ficha_link_codes[other]["expires"] = 0
+        B.ficha_link_new_code("u9", SHEET, None)
+        assert other not in B._ficha_link_codes
+        # sem nome → texto genérico
+        c3 = B.ficha_link_new_code("u1", SHEET2, None)
+        ok, text = B.ficha_link_consume(c3, _link_channel(), user, "me")
+        assert ok and text.startswith(f"🔗 **{B.FICHA_LINK_TEXT['linked_unnamed']}** agora rola aqui."), text
+        # codes são únicos entre os pendentes
+        codes = {B.ficha_link_new_code(f"u{i}", SHEET, None) for i in range(300)}
+        assert len(codes) == 300
+
+
+def test_link_pending_codes_capped_per_account():
+    with _LinkState():
+        sheets = [f"{i:08d}-0000-4000-8000-000000000000" for i in range(B.FICHA_LINK_MAX_PENDING_PER_UID + 1)]
+        codes = [B.ficha_link_new_code("u1", s, None) for s in sheets]
+        assert all(codes[:-1]) and codes[-1] is None, "uma conta não enche o teto global"
+        assert B.ficha_link_new_code("u2", sheets[0], None), "as outras contas continuam"
+        assert B.ficha_link_new_code("u1", sheets[0], None), "trocar o código de uma ficha que já tem um continua valendo"
+
+
+def test_link_consume_seeds_member_cache():
+    with _LinkState():
+        B._ficha_member_cache.clear()
+        user = types.SimpleNamespace(id=556, mention="<@556>")
+        ch = _link_channel()
+        code = B.ficha_link_new_code("u1", SHEET, "Rowan")
+        ok, _ = B.ficha_link_consume(code, ch, user, "me")
+        assert ok and B._ficha_member_cache[(ch.guild.id, "556")][0] is user, "quem ligou conta como membro já"
+        B._ficha_member_cache.clear()
+
+
+def test_transient_discord_errors_are_not_refusals():
+    async def run():
+        orig = B._ficha_resolve_quiet
+        async def flaky(_id):
+            raise B.FichaDiscordTransient(503)
+        B._ficha_resolve_quiet = flaky
+        try:
+            info = await B._ficha_link_info({"channel": "123", "guild": "9", "by": "1"})
+            assert info["usable"] is True and info["name"] == "123", info
+            assert await B._ficha_default_info() is None
+        finally:
+            B._ficha_resolve_quiet = orig
+    asyncio.run(run())
+
+
+def test_link_consume_channel_problems_keep_the_code():
+    with _LinkState():
+        user = types.SimpleNamespace(id=555, mention="<@555>")
+        code = B.ficha_link_new_code("u1", SHEET, "@everyone _Rowan_")
+        T = B.FICHA_LINK_TEXT
+        cases = [
+            (_link_channel(member_ok=False), T["user_cannot_post"].format(mention="<#777>")),
+            (_link_channel(bot_ok=False), T["bot_cannot_post"].format(mention="<#777>")),
+            (_link_channel(ctype=discord.ChannelType.private_thread), T["private_thread"]),
+            (_link_channel(ctype=discord.ChannelType.voice), T["not_text"]),
+            (None, T["not_text"]),
+        ]
+        for ch, expected in cases:
+            ok, text = B.ficha_link_consume(code, ch, user, "me")
+            assert not ok and text == expected, (text, expected)
+            assert code in B._ficha_link_codes, "canal que não serve não gasta o código"
+        B.set_feature(1, "ficha_roll", False)
+        try:
+            ok, text = B.ficha_link_consume(code, _link_channel(), user, "me")
+            assert not ok and text == T["disabled"] and "/config" in text
+        finally:
+            B.set_feature(1, "ficha_roll", True)
+        old = B.FICHA_GUILD_IDS
+        try:
+            B.FICHA_GUILD_IDS = {9}
+            ok, text = B.ficha_link_consume(code, _link_channel(), user, "me")
+            assert not ok and text == T["guild_not_allowed"]
+        finally:
+            B.FICHA_GUILD_IDS = old
+        # o /ficha_canal_padrao continua com as mensagens dele
+        assert B._ficha_canal_problem(_link_channel(member_ok=False), user, "me") == \
+            B.FICHA_CANAL_TEXT["user_cannot_post"].format(mention="<#777>")
+        # nada disto contou como código errado
+        ok, text = B.ficha_link_consume(code, _link_channel(), user, "me")
+        assert ok, text
+        assert "@\u200beveryone" in text and "\\_Rowan\\_" in text, text
+        # ligar de novo noutro canal: diz qual era o anterior
+        code = B.ficha_link_new_code("u1", SHEET, "Rowan")
+        ok, text = B.ficha_link_consume(code, _link_channel(888), user, "me")
+        assert ok and "agora rola aqui. (antes: <#777>)\n" in text, text
+        assert B.ficha_link_binding("u1", SHEET)["channel"] == "888"
+
+
+def test_link_consume_wrong_codes_rate_limited_per_user():
+    with _LinkState():
+        user = types.SimpleNamespace(id=555, mention="<@555>")
+        code = B.ficha_link_new_code("u1", SHEET, "Rowan")
+        for _ in range(B.FICHA_LINK_FAIL_RATE[0]):
+            assert B.ficha_link_consume("ZZZZZZ", _link_channel(), user, "me")[1] == B.FICHA_LINK_TEXT["unknown_code"]
+        ok, text = B.ficha_link_consume(code, _link_channel(), user, "me")
+        assert not ok and text == B.FICHA_LINK_TEXT["rate_limited"] and code in B._ficha_link_codes
+        other = types.SimpleNamespace(id=556, mention="<@556>")
+        ok, _ = B.ficha_link_consume(code, _link_channel(), other, "me")
+        assert ok, "o limite é por pessoa"
+        assert B.ficha_link_binding("u1", SHEET)["by"] == "556"
+
+
+def test_link_per_uid_cap():
+    with _LinkState():
+        user = types.SimpleNamespace(id=555, mention="<@555>")
+        B._ficha_channels()["sheets"]["u1"] = {f"s{i}": {"channel": "1", "guild": "1", "by": "5", "at": 0}
+                                               for i in range(B.FICHA_LINK_MAX_PER_UID - 1)}
+        B._ficha_channels()["sheets"]["u1"][SHEET] = {"channel": "1", "guild": "1", "by": "5", "at": 0}
+        code = B.ficha_link_new_code("u1", SHEET2, "Rowan")
+        ok, text = B.ficha_link_consume(code, _link_channel(), user, "me")
+        assert not ok and str(B.FICHA_LINK_MAX_PER_UID) in text and code in B._ficha_link_codes
+        # ligar de novo uma ficha que já está na conta continua a dar
+        again = B.ficha_link_new_code("u1", SHEET, "Rowan")
+        ok, text = B.ficha_link_consume(again, _link_channel(), user, "me")
+        assert ok and "(antes: <#1>)" in text, text
+        B.ficha_link_unlink("u1", SHEET)
+        ok, _ = B.ficha_link_consume(code, _link_channel(), user, "me")
+        assert ok and len(B._ficha_channels()["sheets"]["u1"]) == B.FICHA_LINK_MAX_PER_UID
+
+
+def test_link_validate_and_binding_sanity():
+    p = B.ficha_link_validate({"action": "code", "sheet": SHEET.upper(), "name": "x" * 200, "extra": 1})
+    assert p["sheet"] == SHEET and len(p["name"]) == B.FICHA_LINK_NAME_MAX and p["name"].endswith("…")
+    with _LinkState():
+        B._ficha_channels()["sheets"]["u1"] = {SHEET: {"channel": "abc", "by": "5"}, SHEET2: "junk"}
+        assert B.ficha_link_binding("u1", SHEET) is None and B.ficha_link_binding("u1", SHEET2) is None
+        B._ficha_channels()["sheets"]["u2"] = ["junk"]
+        assert B.ficha_link_binding("u2", SHEET) is None
+        B.ficha_set_default_channel(888)
+        assert B.ficha_target_channel_id() == (888, "default")
+        B.ficha_set_default_channel(None)
+        assert B.ficha_target_channel_id() == (B.FICHA_ROLL_CHANNEL_ID, "env")
+    assert "/ficha_ligar <codigo>" in B.AJUDA_TEXT and "/ficha_canal [" not in B.AJUDA_TEXT
+    assert "ficha_canal_limpar" not in B.AJUDA_TEXT
+
+
 # ---- HTTP handler (Supabase + Discord faked) ------------------------------------------------------------------
 class _FakeMsg:
     id = 42
@@ -398,28 +590,25 @@ async def _run_handler_tests():
             raise B.FichaAuthError(403, "not_allowed")
         return "user-" + token[-4:]
 
-    orig = (B._ficha_check_token, B._resolve_channel, B._ficha_lookup_discord_id, B._ficha_member_channel,
-            B._ficha_list_channels, B._save_config, B._ficha_resolve_quiet)
+    orig = (B._ficha_check_token, B._resolve_channel, B._ficha_can_post, B._save_config, B._ficha_resolve_quiet)
     B._ficha_check_token = fake_check
     fake = _FakeChannel()
     resolves = {"n": 0}
     player = _FakeChannel()
-    player.id = 777
+    player.id, player.name, player.guild = 777, "mesa", types.SimpleNamespace(id=1, name="AKRASIA")
+    can_post = {"555": True}  # quem ligou (id do Discord) → ainda pode escrever no canal 777?
 
     async def fake_resolve(cid):
         resolves["n"] += 1
+        if cid == 4242:
+            return None  # canal apagado / inacessível
         return player if cid == 777 else fake
 
-    async def fake_did(token):
-        return "555" if token.endswith("linked") and not token.endswith("unlinked") else None
-
-    async def fake_member_channel(did, cid):
-        return player if (did == "555" and cid == 777) else None
-
-    async def fake_list(did):
-        return [{"id": "777", "name": "mesa", "guild": "AKRASIA", "guild_id": "1"}]
-    B._ficha_lookup_discord_id, B._ficha_member_channel, B._ficha_list_channels = fake_did, fake_member_channel, fake_list
+    async def fake_can_post(channel, did):
+        return getattr(channel, "id", None) == 777 and can_post.get(did, False)
+    B._ficha_can_post = fake_can_post
     B._save_config = lambda: None
+    B._ficha_link_codes.clear()
     saved_cfg = B._config.pop("ficha_roll", None)
 
     B._resolve_channel = fake_resolve
@@ -430,13 +619,14 @@ async def _run_handler_tests():
     def reset():
         B._ficha_auth_cache.clear()
         B._ficha_auth_neg_cache.clear()
-        for lim in (B._ficha_roll_limiter, B._ficha_auth_limiter, B._ficha_auth_global_limiter):
+        for lim in (B._ficha_roll_limiter, B._ficha_auth_limiter, B._ficha_auth_global_limiter,
+                    B._ficha_link_limiter, B._ficha_link_fail_limiter):
             lim._hits.clear()
     reset()
 
     app = web.Application(middlewares=[B._cors_middleware])
     app.add_routes([web.post(B.FICHA_ROLL_PATH, B._handle_ficha_roll),
-                    web.post(B.FICHA_CHANNELS_PATH, B._handle_ficha_channels),
+                    web.post(B.FICHA_LINK_PATH, B._handle_ficha_link),
                     web.post("/webhook/roll", lambda r: web.json_response({"x": 1})),
                     web.route("OPTIONS", "/{tail:.*}", B._handle_options)])
     client = TestClient(TestServer(app))
@@ -577,73 +767,142 @@ async def _run_handler_tests():
         B.set_feature(999, "ficha_roll", True)
         r = await client.post(B.FICHA_ROLL_PATH, json=BASE, headers=H())
         assert r.status == 200, "disabling invites must not disable rolls"
-        # --- canais: escolhido na ficha (verificado), /ficha_canal, padrão
-        def again():
-            reset(); B._ficha_discord_cache.clear()
-        again()
-        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "777"}, headers=H("a.b.xlinked"))
-        assert r.status == 200 and (await r.json())["channel_id"] == "777" and player.sent
-        again()
-        n = len(player.sent) + len(fake.sent)
-        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "999"}, headers=H("a.b.xlinked"))
-        assert r.status == 403 and (await r.json())["error"] == "channel_not_allowed"
-        again()
-        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "777"}, headers=H("a.b.unlinked"))
-        assert r.status == 403 and len(player.sent) + len(fake.sent) == n, "nada postado quando recusado"
-        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "12ab"}, headers=H("a.b.xlinked"))
-        assert r.status == 400
-        again()
-        # consulta da conta ligada falhou: nada de 403, vai para o padrão, e não fica em cache
-        async def did_down(token):
-            raise B.FichaLookupError("503")
-        B._ficha_lookup_discord_id = did_down
-        again()
-        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "777"}, headers=H("a.b.xlinked"))
-        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id)
-        assert not B._ficha_discord_cache
-        B._ficha_lookup_discord_id = fake_did
-        B.ficha_set_channel("555", 777, 1)
-        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=H("a.b.xlinked"))
-        assert r.status == 200 and (await r.json())["channel_id"] == "777"
-        again()
-        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=H("a.b.unlinked"))
-        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id)
-        # /ficha_canal verificado a cada rolagem: sem permissão hoje → padrão
-        B.ficha_set_channel("555", 778, 1)
-        again()
-        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=H("a.b.xlinked"))
-        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id)
-        B.ficha_set_channel("555", 777, 1)
+        # --- ficha ligada a um canal (/ficha_ligar com código) --------------------------------------------------
+        reset()
+        LINK = B.FICHA_LINK_PATH
+        uid = "user-good"
+        sheet_up = SHEET.upper()
+        # auth e validação
+        r = await client.post(LINK, json={"action": "status", "sheet": SHEET})
+        assert r.status == 401 and (await r.json())["error"] == "unauthorized"
+        r = await client.post(LINK, data=b'{"action":"code","sheet":"' + b"x" * 1100 + b'"}', headers=H())
+        assert r.status == 413
+        for bad in (b"not json", b'{"action": NaN}', b"[]", b'{"action":"code"}', b'{"action":"x","sheet":"%s"}' % SHEET.encode(),
+                    b'{"action":"code","sheet":"12345"}', b'{"action":"code","sheet":5}',
+                    b'{"action":"code","sheet":"%s","name":5}' % SHEET.encode()):
+            r = await client.post(LINK, data=bad, headers=H())
+            assert r.status == 400 and (await r.json())["error"] == "invalid_payload", bad
+        r = await client.post(LINK, json={"action": "status", "sheet": SHEET}, headers=H("a.b.notinvited"))
+        assert r.status == 403 and (await r.json())["error"] == "not_allowed"
+        r = await client.options(LINK, headers={"Origin": "https://ordemcodex.xyz", "Access-Control-Request-Method": "POST"})
+        assert r.headers.get("Access-Control-Allow-Origin") == "https://ordemcodex.xyz"
+        r = await client.options(LINK, headers={"Origin": "https://evil.example"})
+        assert "Access-Control-Allow-Origin" not in r.headers
 
+        # nada ligado: status vazio com o padrão
+        r = await client.post(LINK, json={"action": "status", "sheet": SHEET}, headers=H())
+        body = await r.json()
+        assert r.status == 200 and body["linked"] is None and body["pending"] is False, body
+        assert body["default"]["id"] == str(fake.id)
+
+        # código → pendente (sheet em maiúsculas guardado em minúsculas)
+        r = await client.post(LINK, json={"action": "code", "sheet": sheet_up, "name": "  Rowan\n**Ka**  "}, headers=H())
+        body = await r.json()
+        assert r.status == 200 and body["ok"] and body["expires_in"] == 600, body
+        code = body["code"]
+        assert len(code) == 6 and set(code) <= set(B.FICHA_LINK_ALPHABET)
+        assert B._ficha_link_codes[code] == {**B._ficha_link_codes[code], "uid": uid, "sheet": SHEET, "name": "Rowan **Ka**"}
+        r = await client.post(LINK, json={"action": "status", "sheet": SHEET}, headers=H())
+        assert (await r.json())["pending"] is True
+        # rolagem com a ficha ainda não ligada → padrão
+        n_def = len(fake.sent)
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "sheet": SHEET}, headers=H())
+        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id) and len(fake.sent) == n_def + 1
+
+        # /ficha_ligar no canal da mesa (lógica do comando, sem Interaction)
+        ch, user, me = _link_channel(777), types.SimpleNamespace(id=555, mention="<@555>"), "me"
+        ok, text = B.ficha_link_consume(f" {code[:3].lower()}-{code[3:]} ", ch, user, me)
+        assert ok and text.startswith("🔗 **Rowan \\*\\*Ka\\*\\*** agora rola aqui.\n"), text
+        assert "<@555>" in text and "antes" not in text
+        assert code not in B._ficha_link_codes
+        assert B._config["ficha_roll"]["sheets"][uid][SHEET] == {**B._config["ficha_roll"]["sheets"][uid][SHEET],
+                                                                 "channel": "777", "guild": "1", "by": "555"}
+        ok, _ = B.ficha_link_consume(code, ch, user, me)
+        assert not ok, "código só vale uma vez"
+        r = await client.post(LINK, json={"action": "status", "sheet": SHEET}, headers=H())
+        body = await r.json()
+        assert body["linked"] == {"id": "777", "name": "mesa", "guild": "AKRASIA", "usable": True}, body
+        assert body["pending"] is False
+
+        # rolagem com sheet → canal ligado (Ordem 1 e Ordem 2); `channel` antigo é ignorado
+        n_p = len(player.sent)
+        for roll in ({**OP2, "sheet": sheet_up}, {**BASE, "sheet": SHEET, "channel": "999"}):
+            reset()
+            r = await client.post(B.FICHA_ROLL_PATH, json=roll, headers=H())
+            assert r.status == 200 and (await r.json())["channel_id"] == "777", roll
+        assert len(player.sent) == n_p + 2
+        assert not player.sent[-1]["allowed_mentions"].everyone
+        # sem sheet → padrão, mesmo com `channel`
+        reset()
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "777"}, headers=H())
+        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id)
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "12ab"}, headers=H())
+        assert r.status == 200, "channel inválido já não dá erro (é ignorado)"
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "sheet": "12ab"}, headers=H())
+        assert r.status == 400 and "sheet" in (await r.json())["detail"]
+        # outra ficha da mesma conta, e a mesma ficha noutra conta → padrão
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "sheet": SHEET2}, headers=H())
+        assert (await r.json())["channel_id"] == str(fake.id)
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "sheet": SHEET}, headers=H("a.b.othr"))
+        assert (await r.json())["channel_id"] == str(fake.id)
+
+        # quem ligou perdeu a permissão → 403, nada é postado; status diz usable false
+        reset()
+        can_post["555"] = False
+        n_all = len(player.sent) + len(fake.sent)
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "sheet": SHEET}, headers=H())
+        assert r.status == 403 and (await r.json())["error"] == "channel_not_allowed"
+        assert len(player.sent) + len(fake.sent) == n_all, "nada postado quando recusado"
+        r = await client.post(LINK, json={"action": "status", "sheet": SHEET}, headers=H())
+        assert (await r.json())["linked"]["usable"] is False
+        can_post["555"] = True
+        # o Discord recusa o envio → 502, sem cair para o padrão
         async def player_forbidden(**kw):
             raise discord.Forbidden(types.SimpleNamespace(status=403, reason="x"), "no")
         player.send = player_forbidden
-        again()
-        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=H("a.b.xlinked"))
-        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id), "canal do /ficha_canal falhou → padrão"
+        n_def = len(fake.sent)
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "sheet": SHEET}, headers=H())
+        assert r.status == 502 and (await r.json())["error"] == "discord_error" and len(fake.sent) == n_def
         del player.send
-        B.ficha_set_channel("555", None)
-        assert B.ficha_target_channel_id("555") == (B.FICHA_ROLL_CHANNEL_ID, "env")
-        B.ficha_set_channel(None, 888)
-        assert B.ficha_target_channel_id("555") == (888, "default")
-        B.ficha_set_channel(None, None)
-        again()
-        r = await client.post(B.FICHA_CHANNELS_PATH, json={}, headers=H("a.b.xlinked"))
+
+        # canal inacessível: status mostra os ids, usable false
+        B._config["ficha_roll"]["sheets"][uid][SHEET2] = {"channel": "4242", "guild": "31", "by": "555", "at": 1}
+        r = await client.post(LINK, json={"action": "status", "sheet": SHEET2}, headers=H())
+        assert (await r.json())["linked"] == {"id": "4242", "name": "4242", "guild": "31", "usable": False}
+
+        # desligar → padrão; o código pendente também vai
+        r = await client.post(LINK, json={"action": "code", "sheet": SHEET}, headers=H())
+        assert (await r.json())["code"] in B._ficha_link_codes
+        r = await client.post(LINK, json={"action": "unlink", "sheet": SHEET}, headers=H())
         body = await r.json()
-        assert r.status == 200 and body["linked"] is True and body["channels"][0]["id"] == "777", body
-        again()
-        r = await client.post(B.FICHA_CHANNELS_PATH, json={}, headers=H("a.b.unlinked"))
-        body = await r.json()
-        assert body["linked"] is False and body["channels"] == [] and body["default"]["id"] == str(fake.id), body
-        r = await client.post(B.FICHA_CHANNELS_PATH, json={})
-        assert r.status == 401
-        r = await client.options(B.FICHA_CHANNELS_PATH, headers={"Origin": "https://ordemcodex.xyz",
-                                                                 "Access-Control-Request-Method": "POST"})
-        assert r.headers.get("Access-Control-Allow-Origin") == "https://ordemcodex.xyz"
+        assert body == {"ok": True, "linked": None, "pending": False, "default": body["default"]} and body["default"]
+        assert SHEET not in B._config["ficha_roll"]["sheets"][uid]
+        assert not any(v["sheet"] == SHEET for v in B._ficha_link_codes.values())
+        reset()
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "sheet": SHEET}, headers=H())
+        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id)
+
+        # limite por conta: 30 pedidos / 60 s
+        reset()
+        for i in range(B.FICHA_LINK_RATE[0]):
+            r = await client.post(LINK, json={"action": "status", "sheet": SHEET}, headers=H())
+            assert r.status == 200, i
+        r = await client.post(LINK, json={"action": "status", "sheet": SHEET}, headers=H())
+        assert r.status == 429 and (await r.json())["error"] == "rate_limited" and int(r.headers["Retry-After"]) >= 1
+
+        # teto global de códigos → 503 busy
+        reset()
+        old_max = B.FICHA_LINK_MAX_PENDING
+        try:
+            B.FICHA_LINK_MAX_PENDING = len(B._ficha_link_codes)
+            r = await client.post(LINK, json={"action": "code", "sheet": SHEET2}, headers=H())
+            assert r.status == 503 and (await r.json())["error"] == "busy"
+        finally:
+            B.FICHA_LINK_MAX_PENDING = old_max
     finally:
         await client.close()
-        (B._ficha_check_token, B._resolve_channel, B._ficha_lookup_discord_id, B._ficha_member_channel,
-         B._ficha_list_channels, B._save_config, B._ficha_resolve_quiet) = orig
+        (B._ficha_check_token, B._resolve_channel, B._ficha_can_post, B._save_config, B._ficha_resolve_quiet) = orig
+        B._ficha_link_codes.clear()
         B._config.pop("ficha_roll", None)
         if saved_cfg is not None:
             B._config["ficha_roll"] = saved_cfg

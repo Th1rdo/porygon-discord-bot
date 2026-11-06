@@ -412,7 +412,7 @@ async def _cors_middleware(request: web.Request, handler):
         resp = web.Response(status=204)
     else:
         resp = await handler(request)
-    if request.path in (FICHA_ROLL_PATH, FICHA_CHANNELS_PATH):
+    if request.path in (FICHA_ROLL_PATH, FICHA_LINK_PATH):
         # rolagens da ficha: só o site (lista fechada) e com o header Authorization
         origin = request.headers.get("Origin", "")
         if origin in FICHA_ROLL_ORIGINS:
@@ -435,7 +435,7 @@ async def _ensure_webhook_server():
         web.post("/webhook/broadcast", _handle_broadcast),
         web.post("/webhook/preset", _handle_preset),
         web.post(FICHA_ROLL_PATH, _handle_ficha_roll),
-        web.post(FICHA_CHANNELS_PATH, _handle_ficha_channels),
+        web.post(FICHA_LINK_PATH, _handle_ficha_link),
         web.route("OPTIONS", "/{tail:.*}", _handle_options),
     ])
     runner = web.AppRunner(app)
@@ -1432,14 +1432,18 @@ async def ficha_convite_slash(interaction: discord.Interaction, email: str):
 # O site (ordemcodex.xyz) manda cada rolagem para POST /webhook/ficha-roll com o access token do Supabase do
 # jogador (Authorization: Bearer …). Sem segredo partilhado no browser: o bot confirma o token no Supabase
 # (/auth/v1/user) e que a conta está na lista de convidados (rpc ficha_paranormal.am_i_allowed), e só então posta
-# um embed no canal escolhido: o do jogador (/ficha_canal, pela conta do Discord ligada no /ficha_convite), senão o
-# padrão (/ficha_canal_padrao, só o dono do bot), senão FICHA_ROLL_CHANNEL_ID. Vale para Ordem 1 e Ordem 2.
+# um embed. Para onde: cada FICHA pode estar ligada a um canal. A ficha pede um código a POST /webhook/ficha-link
+# (6 letras, 10 min, só em memória) e alguém corre /ficha_ligar <código> no canal da mesa; quem corre tem de poder
+# escrever lá (e o bot também). A ligação fica em _config["ficha_roll"]["sheets"][uid][ficha]. Cada rolagem traz
+# `sheet`: ficha ligada → esse canal, re-verificando quem ligou e o bot (se já não dá: 403, nada é postado); ficha
+# não ligada → o padrão (/ficha_canal_padrao, só o dono do bot), senão FICHA_ROLL_CHANNEL_ID. Ordem 1 e Ordem 2.
 import hashlib
 import base64
+import secrets
 from collections import deque
 
 FICHA_ROLL_PATH = "/webhook/ficha-roll"
-FICHA_CHANNELS_PATH = "/webhook/ficha-channels"  # a ficha lista os canais onde o jogador pode mandar as rolagens
+FICHA_LINK_PATH = "/webhook/ficha-link"  # a ficha pede o código, vê o estado da ligação e desliga
 FICHA_ROLL_CHANNEL_ID = int(os.getenv("FICHA_ROLL_CHANNEL_ID", "1165819468354687066"))
 FICHA_ROLL_ORIGINS = frozenset(
     o.strip().rstrip("/") for o in os.getenv(
@@ -1467,8 +1471,42 @@ FICHA_ROLL_RATE = (8, 10.0)      # 8 rolagens / 10 s por utilizador
 FICHA_ROLL_AUTH_RATE = (30, 60.0)  # 30 verificações novas no Supabase / 60 s por IP (cache miss)
 FICHA_ROLL_AUTH_GLOBAL_RATE = (120, 60.0)  # teto GLOBAL de verificações novas / 60 s (não depende de headers)
 FICHA_ROLL_AUTH_NEG_TTL = 60       # s — tokens recusados (401) ficam em cache negativa
+FICHA_LINK_MAX_BODY = 1024         # bytes
+FICHA_LINK_RATE = (30, 60.0)       # 30 pedidos / 60 s por utilizador do site (code / status / unlink)
+FICHA_LINK_FAIL_RATE = (5, 60.0)   # 5 códigos errados / 60 s por pessoa no Discord (/ficha_ligar)
+FICHA_LINK_ACTIONS = ("code", "status", "unlink")
+FICHA_LINK_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sem I, O, 0, 1: não se confundem ao copiar
+FICHA_LINK_CODE_LEN = 6
+FICHA_LINK_CODE_TTL = 600          # s — validade de um código
+FICHA_LINK_MAX_PENDING = 2000      # códigos vivos no total (em memória)
+FICHA_LINK_MAX_PER_UID = 100       # fichas ligadas por conta do site
+FICHA_LINK_MAX_PENDING_PER_UID = 10  # códigos vivos por conta do site (o resto do teto global fica para os outros)
+FICHA_LINK_NAME_MAX = 80           # chars do nome da personagem guardado com o código
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _JWT_RE = re.compile(r"^[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$")
 _CTRL_RE = re.compile("[\x00-\x1f\x7f\u200b-\u200f\u2028\u2029]+")
+
+
+# Texto do /ficha_ligar (cópia da spec de UX, 2026-11-06). Tudo o que a pessoa lê está aqui.
+# {personagem} e {user} já chegam escapados / como menção; {mention} é a menção do canal.
+FICHA_LINK_TEXT = {
+    "command": "Ligar uma ficha do site a este canal: as rolagens dela passam a aparecer aqui",
+    "option": "O código que aparece na ficha, em Ligar a um canal (ex.: 7KQ2M9)",
+    "linked": "🔗 **{personagem}** agora rola aqui.{antes}\n-# Ligada por {user}. Para desligar, abre a ficha.",
+    "linked_unnamed": "A ficha",  # quando a ficha não mandou o nome da personagem
+    "before": " (antes: <#{channel}>)",  # a ficha já estava ligada a outro canal
+    "unknown_code": "Esse código não vale (está errado ou expirou). Gera outro na ficha, em **Ligar a um canal**.",
+    "rate_limited": "Muitos códigos errados seguidos. Espera um minuto e tenta de novo.",
+    "too_many_links": ("Esta conta do site já tem {max} fichas ligadas a canais. Desliga uma na ficha "
+                       "(**Ligar a um canal → Desligar**) e tenta de novo."),
+    # variante "ligar" das mensagens de _ficha_canal_problem (o /ficha_canal_padrao mantém as dele)
+    "not_text": "Usa o comando num canal de texto ou numa thread pública.",
+    "guild_not_allowed": "As rolagens da ficha não podem vir para este servidor.",
+    "private_thread": "Threads privadas não dão. Usa o comando num canal ou numa thread pública.",
+    "user_cannot_post": "Tu não podes escrever em {mention}, por isso a ficha não pode rolar aqui.",
+    "bot_cannot_post": "Eu não consigo escrever em {mention} (preciso de ver o canal, enviar mensagens e inserir links).",
+    "disabled": "As rolagens da ficha estão desativadas neste servidor. Um admin pode ligá-las em `/config`.",
+}
 
 
 class FichaRollError(ValueError):
@@ -1497,6 +1535,16 @@ class SlidingWindowLimiter:
         q.append(now)
         return 0.0
 
+    def peek(self, key: str, now: float | None = None) -> float:
+        """Como hit, mas sem registar: 0 se ainda há vaga, senão os segundos até haver."""
+        now = time.monotonic() if now is None else now
+        q = self._hits.get(key)
+        while q and now - q[0] >= self.window:
+            q.popleft()
+        if q and len(q) >= self.limit:
+            return max(0.001, self.window - (now - q[0]))
+        return 0.0
+
     def _prune(self, now: float) -> None:
         for k in [k for k, q in self._hits.items() if not q or now - q[-1] >= self.window]:
             del self._hits[k]
@@ -1504,7 +1552,7 @@ class SlidingWindowLimiter:
             self._hits.clear()
 
 
-def _ficha_text(value, field: str, required: bool = False) -> str | None:
+def _ficha_text(value, field: str, required: bool = False, max_len: int = FICHA_ROLL_TEXT_MAX) -> str | None:
     if value is None:
         if required:
             raise FichaRollError(f"{field} is required")
@@ -1516,8 +1564,8 @@ def _ficha_text(value, field: str, required: bool = False) -> str | None:
         if required:
             raise FichaRollError(f"{field} must not be empty")
         return None
-    if len(text) > FICHA_ROLL_TEXT_MAX:
-        text = text[: FICHA_ROLL_TEXT_MAX - 1].rstrip() + "…"
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
     return text
 
 
@@ -1605,17 +1653,17 @@ def _op2_validate(data: dict) -> dict:
         "damage": _ficha_damage(data.get("damage")),
         "extra": _ficha_text(data.get("extra"), "extra"),
         "followUp": _ficha_text(data.get("followUp"), "followUp"),
-        "channel": _ficha_channel_field(data.get("channel")),
+        "sheet": _ficha_sheet_field(data.get("sheet")),
     }
 
 
-def _ficha_channel_field(value) -> str | None:
-    """Canal escolhido na ficha (id do Discord, só dígitos) ou None."""
+def _ficha_sheet_field(value) -> str | None:
+    """Id da ficha (uuid, guardado em minúsculas) ou None. `channel` (versões antigas da ficha) é ignorado."""
     if value is None or value == "":
         return None
-    if not isinstance(value, str) or not value.isdigit() or len(value) > 20:
-        raise FichaRollError("channel must be a Discord channel id")
-    return value
+    if not isinstance(value, str) or not _UUID_RE.match(value):
+        raise FichaRollError("sheet must be a sheet id (uuid)")
+    return value.lower()
 
 
 def ficha_roll_validate(data) -> dict:
@@ -1637,7 +1685,7 @@ def ficha_roll_validate(data) -> dict:
         "attack": None,
         "damage": None,
         "extra": _ficha_text(data.get("extra"), "extra"),
-        "channel": _ficha_channel_field(data.get("channel")),
+        "sheet": _ficha_sheet_field(data.get("sheet")),
     }
     attack = data.get("attack")
     if attack is not None:
@@ -1789,44 +1837,128 @@ class FichaAuthError(Exception):
 _ficha_auth_cache: dict[str, tuple[str, float]] = {}  # sha256(token) → (user_id, expira_em epoch)
 _ficha_auth_neg_cache: dict[str, float] = {}          # sha256(token) → expira_em epoch (token recusado, 401)
 _ficha_roll_limiter = SlidingWindowLimiter(*FICHA_ROLL_RATE)
-_ficha_channels_limiter = SlidingWindowLimiter(6, 60.0)  # a ficha pede a lista ao abrir o seletor
+_ficha_link_limiter = SlidingWindowLimiter(*FICHA_LINK_RATE)
+_ficha_link_fail_limiter = SlidingWindowLimiter(*FICHA_LINK_FAIL_RATE)  # por id do Discord
 _ficha_auth_limiter = SlidingWindowLimiter(*FICHA_ROLL_AUTH_RATE)
 _ficha_auth_global_limiter = SlidingWindowLimiter(*FICHA_ROLL_AUTH_GLOBAL_RATE)
 _ficha_http: aiohttp.ClientSession | None = None
-_ficha_roll_channel = None  # cache do canal PADRÃO (os canais de cada jogador são resolvidos a cada vez)
-_ficha_discord_cache: dict[str, tuple[str | None, float]] = {}  # sha256(token) → (id do Discord ligado, expira_em)
+_ficha_roll_channel = None  # cache do canal PADRÃO (os canais das fichas ligadas são resolvidos a cada vez)
+# Códigos do /ficha_ligar à espera, só em memória (perdem-se ao reiniciar: a ficha pede outro).
+_ficha_link_codes: dict[str, dict] = {}  # código → {"uid", "sheet", "name", "expires" (epoch)}
 
 
 def _ficha_channels() -> dict:
-    """Escolhas de canal guardadas no guild_config.json (mesmo volume): {"default": id|None, "users": {discord_id: {...}}}."""
+    """Canais das rolagens no guild_config.json (mesmo volume): {"default": id|None, "sheets": {uid: {ficha: {...}}}}.
+    "users" (escolhas antigas do /ficha_canal, por conta do Discord) fica no ficheiro, sem uso."""
     cfg = _config.setdefault("ficha_roll", {})
-    if not isinstance(cfg.get("users"), dict):
-        cfg["users"] = {}
+    if not isinstance(cfg.get("sheets"), dict):
+        cfg["sheets"] = {}
     cfg.setdefault("default", None)
     return cfg
 
 
-def ficha_target_channel_id(discord_id: str | None) -> tuple[int, str]:
-    """Canal da rolagem e de onde veio: ("user" | "default" | "env"). Puro, sem Discord."""
+def ficha_target_channel_id() -> tuple[int, str]:
+    """Canal das fichas não ligadas e de onde veio: ("default" | "env"). Puro, sem Discord."""
     cfg = _ficha_channels()
-    pref = cfg["users"].get(str(discord_id)) if discord_id else None
-    if isinstance(pref, dict) and str(pref.get("channel", "")).isdigit():
-        return int(pref["channel"]), "user"
     if str(cfg.get("default") or "").isdigit():
         return int(cfg["default"]), "default"
     return FICHA_ROLL_CHANNEL_ID, "env"
 
 
-def ficha_set_channel(discord_id: str | None, channel_id: int | None, guild_id: int | None = None) -> None:
-    """discord_id None = canal padrão. channel_id None = apaga a escolha."""
-    cfg = _ficha_channels()
-    if discord_id is None:
-        cfg["default"] = str(channel_id) if channel_id else None
-    elif channel_id is None:
-        cfg["users"].pop(str(discord_id), None)
-    else:
-        cfg["users"][str(discord_id)] = {"channel": str(channel_id), "guild": str(guild_id or "")}
+def ficha_set_default_channel(channel_id: int | None) -> None:
+    """Canal padrão (/ficha_canal_padrao). None = volta a FICHA_ROLL_CHANNEL_ID."""
+    _ficha_channels()["default"] = str(channel_id) if channel_id else None
     _save_config()
+
+
+def ficha_link_binding(uid: str, sheet: str) -> dict | None:
+    """A ligação (uid, ficha) → {"channel", "guild", "by", "at"}, ou None (também se o registo estiver estragado)."""
+    mine = _ficha_channels()["sheets"].get(uid)
+    entry = mine.get(sheet) if isinstance(mine, dict) else None
+    if (not isinstance(entry, dict) or not str(entry.get("channel", "")).isdigit()
+            or not str(entry.get("by", "")).isdigit()):
+        return None
+    return entry
+
+
+def ficha_link_pending(uid: str, sheet: str, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    return any(v["uid"] == uid and v["sheet"] == sheet and v["expires"] > now for v in _ficha_link_codes.values())
+
+
+def ficha_link_new_code(uid: str, sheet: str, name: str | None, now: float | None = None) -> str | None:
+    """Código novo para (uid, ficha); o anterior desse par deixa de valer. None se já há códigos demais."""
+    now = time.time() if now is None else now
+    for code in [c for c, v in _ficha_link_codes.items()
+                 if v["expires"] <= now or (v["uid"] == uid and v["sheet"] == sheet)]:
+        del _ficha_link_codes[code]
+    if len(_ficha_link_codes) >= FICHA_LINK_MAX_PENDING:
+        return None
+    if sum(1 for v in _ficha_link_codes.values() if v["uid"] == uid) >= FICHA_LINK_MAX_PENDING_PER_UID:
+        return None
+    while True:
+        code = "".join(secrets.choice(FICHA_LINK_ALPHABET) for _ in range(FICHA_LINK_CODE_LEN))
+        if code not in _ficha_link_codes:
+            break
+    _ficha_link_codes[code] = {"uid": uid, "sheet": sheet, "name": name, "expires": now + FICHA_LINK_CODE_TTL}
+    return code
+
+
+def ficha_link_unlink(uid: str, sheet: str) -> None:
+    """Apaga a ligação e o código à espera da ficha."""
+    for code in [c for c, v in _ficha_link_codes.items() if v["uid"] == uid and v["sheet"] == sheet]:
+        del _ficha_link_codes[code]
+    sheets = _ficha_channels()["sheets"]
+    mine = sheets.get(uid)
+    if isinstance(mine, dict) and sheet in mine:
+        del mine[sheet]
+        if not mine:
+            del sheets[uid]
+        _save_config()
+
+
+def _ficha_link_code_norm(code) -> str:
+    return "".join(str(code or "").split()).replace("-", "").upper()
+
+
+def ficha_link_consume(code, channel, user, me, now: float | None = None) -> tuple[bool, str]:
+    """O que o /ficha_ligar faz (sem Interaction, testável): (True, resposta pública) se ligou, senão
+    (False, erro só para quem correu). Código errado conta para o limite por pessoa; canal que não serve não
+    gasta o código."""
+    now = time.time() if now is None else now
+    t = FICHA_LINK_TEXT
+    who = str(user.id)
+    if _ficha_link_fail_limiter.peek(who):
+        return False, t["rate_limited"]
+    key = _ficha_link_code_norm(code)
+    pending = _ficha_link_codes.get(key)
+    if pending is not None and pending["expires"] <= now:
+        del _ficha_link_codes[key]
+        pending = None
+    if pending is None:
+        _ficha_link_fail_limiter.hit(who)
+        return False, t["unknown_code"]
+    problem = _ficha_canal_problem(channel, user, me, texts=t)
+    if problem:
+        return False, problem
+    uid, sheet = pending["uid"], pending["sheet"]
+    sheets = _ficha_channels()["sheets"]
+    mine = sheets.get(uid) if isinstance(sheets.get(uid), dict) else None
+    if mine is not None and sheet not in mine and len(mine) >= FICHA_LINK_MAX_PER_UID:
+        return False, t["too_many_links"].format(max=FICHA_LINK_MAX_PER_UID)
+    old = ficha_link_binding(uid, sheet)
+    before = t["before"].format(channel=old["channel"]) if old and old["channel"] != str(channel.id) else ""
+    if mine is None:
+        mine = sheets[uid] = {}
+    mine[sheet] = {"channel": str(channel.id), "guild": str(channel.guild.id), "by": who, "at": int(now)}
+    del _ficha_link_codes[key]
+    _save_config()
+    # quem acabou de ligar pode escrever aqui agora: o cache de membros (60 s) não pode dizer o contrário
+    t_now = time.time()
+    _bounded_put(_ficha_member_cache, (channel.guild.id, who), (user, t_now + 60), t_now, lambda v: v[1])
+    name = pending.get("name")
+    shown = (discord.utils.escape_mentions(discord.utils.escape_markdown(name)) if name else t["linked_unnamed"])
+    return True, t["linked"].format(personagem=shown, antes=before, user=user.mention)
 
 
 def _ficha_http_session() -> aiohttp.ClientSession:
@@ -1874,42 +2006,6 @@ async def _ficha_check_token(token: str) -> str:
     if not ok:
         raise FichaAuthError(403, "not_allowed")
     return uid
-
-
-class FichaLookupError(Exception):
-    """A consulta da conta ligada falhou (rede, 5xx, função em falta): não é o mesmo que "não ligada"."""
-
-
-async def _ficha_lookup_discord_id(token: str) -> str | None:
-    """Conta do Discord ligada a esta conta do site (rpc my_discord_user_id): o id, ou None se não está ligada.
-    Levanta FichaLookupError se não deu para saber."""
-    headers = {"apikey": FICHA_SUPABASE_KEY, "Authorization": f"Bearer {token}",
-               "Content-Type": "application/json", "Content-Profile": "ficha_paranormal"}
-    try:
-        async with _ficha_http_session().post(f"{FICHA_SUPABASE_URL}/rest/v1/rpc/my_discord_user_id",
-                                              headers=headers, json={}) as r:
-            if r.status != 200:
-                raise FichaLookupError(r.status)
-            value = await r.json(content_type=None)
-            return value if isinstance(value, str) and value.isdigit() else None
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-        raise FichaLookupError(type(e).__name__)
-
-
-async def _ficha_discord_id(token: str) -> str | None:
-    """Com cache como o da autenticação (o token já foi confirmado antes de chegar aqui). Só guarda respostas
-    de verdade; se a consulta falhar levanta FichaLookupError, sem cache."""
-    key = hashlib.sha256(token.encode()).hexdigest()
-    now = time.time()
-    cached = _ficha_discord_cache.get(key)
-    if cached and cached[1] > now:
-        return cached[0]
-    did = await _ficha_lookup_discord_id(token)
-    exp = _jwt_exp(token)
-    expires = min(now + FICHA_ROLL_AUTH_TTL, exp) if exp is not None else now + FICHA_ROLL_AUTH_TTL
-    if expires > now:
-        _bounded_put(_ficha_discord_cache, key, (did, expires), now, lambda v: v[1])
-    return did
 
 
 def _bounded_put(cache: dict, key: str, value, now: float, expiry_of, max_size: int = 1000) -> None:
@@ -2019,36 +2115,22 @@ async def _handle_ficha_roll(request: web.Request) -> web.StreamResponse:
         return _rate_limited(wait)
 
     await ready_event.wait()
-    try:
-        discord_id = await _ficha_discord_id(token)
-        lookup_failed = False
-    except FichaLookupError as e:
-        logging.warning("ficha-roll: linked-account lookup failed (%s) — using the default channel", e)
-        discord_id, lookup_failed = None, True
-    target, source = ficha_target_channel_id(discord_id)
-    msg = channel = None
-    if payload.get("channel") and not lookup_failed:
-        # escolhido na ficha: só se a conta do Discord ligada pode escrever lá (senão nada é postado)
-        channel = await _ficha_member_channel(discord_id, int(payload["channel"]))
+    binding = ficha_link_binding(uid, payload["sheet"]) if payload.get("sheet") else None
+    if binding is not None:
+        # ficha ligada (/ficha_ligar): verificado a cada rolagem que quem ligou e o bot ainda podem escrever lá
+        try:
+            channel = await _ficha_member_channel(binding["by"], int(binding["channel"]))
+        except FichaDiscordTransient as e:
+            logging.warning("ficha-roll: Discord unavailable checking linked channel (%s)", e)
+            return _json_err(503, "channel_unavailable")
         if channel is None:
             return _json_err(403, "channel_not_allowed")
         try:
             msg = await channel.send(embed=ficha_roll_embed(payload), allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException as e:
-            logging.warning("ficha-roll: chosen channel %s refused send (%s)", channel.id, e.status)
+            logging.warning("ficha-roll: linked channel %s refused send (%s)", channel.id, e.status)
             return _json_err(502, "discord_error")
-    elif source == "user":
-        # a escolha do /ficha_canal é verificada de novo a cada rolagem (saiu do servidor, perdeu permissão…)
-        channel = await _ficha_member_channel(discord_id, target)
-        if channel is not None:
-            try:
-                msg = await channel.send(embed=ficha_roll_embed(payload), allowed_mentions=discord.AllowedMentions.none())
-            except discord.HTTPException as e:
-                logging.warning("ficha-roll: player channel %s refused send (%s) — using the default", target, e.status)
-                msg = None
-        else:
-            logging.warning("ficha-roll: player channel %s unavailable — using the default", target)
-    if msg is None:
+    else:
         resp = await _ficha_send_default(payload)
         if isinstance(resp, web.Response):
             return resp
@@ -2058,6 +2140,10 @@ async def _handle_ficha_roll(request: web.Request) -> web.StreamResponse:
 
 
 _ficha_member_cache: dict[tuple[int, str], tuple[object, float]] = {}  # (guild, discord id) → (membro|None, expira)
+
+
+class FichaDiscordTransient(Exception):
+    """O Discord falhou agora (5xx, 429, rede): não quer dizer que o canal ou a pessoa não servem."""
 
 
 async def _ficha_member(guild, discord_id: str):
@@ -2072,8 +2158,8 @@ async def _ficha_member(guild, discord_id: str):
             member = await guild.fetch_member(int(discord_id))
         except (discord.NotFound, discord.Forbidden):
             member = None
-        except discord.HTTPException:
-            return None  # sem cache: tenta de novo da próxima vez
+        except discord.HTTPException as e:
+            raise FichaDiscordTransient(e.status)  # sem cache: tenta de novo da próxima vez
     _bounded_put(_ficha_member_cache, key, (member, now + 60), now, lambda v: v[1])
     return member
 
@@ -2099,71 +2185,115 @@ async def _ficha_resolve_quiet(channel_id: int):
     if ch is None:
         try:
             ch = await bot.fetch_channel(channel_id)
-        except discord.HTTPException:
+        except (discord.NotFound, discord.Forbidden, discord.InvalidData):
             return None
+        except discord.HTTPException as e:
+            raise FichaDiscordTransient(e.status)
     return ch
 
 
+async def _ficha_can_post(channel, discord_id: str | None) -> bool:
+    """A conta do Discord e o bot podem escrever neste canal (servidor permitido, ficha_roll ligado)?"""
+    guild = getattr(channel, "guild", None)
+    if not discord_id or guild is None or not _ficha_guild_ok(guild):
+        return False
+    member = await _ficha_member(guild, discord_id)
+    return _ficha_channel_ok(channel, member, guild.me)
+
+
 async def _ficha_member_channel(discord_id: str | None, channel_id: int):
-    """O canal, se a conta do Discord ligada pode escrever nele; senão None."""
+    """O canal, se a conta do Discord pode escrever nele (e o bot também); senão None."""
     if not discord_id:
         return None
     channel = await _ficha_resolve_quiet(channel_id)
-    guild = getattr(channel, "guild", None)
-    if guild is None or not _ficha_guild_ok(guild):
+    return channel if await _ficha_can_post(channel, discord_id) else None
+
+
+async def _ficha_default_info() -> dict | None:
+    """O canal das fichas não ligadas, como a ficha o mostra: {id, name, guild} ou None."""
+    default_id, _ = ficha_target_channel_id()
+    try:
+        ch = await _ficha_resolve_quiet(default_id)
+    except FichaDiscordTransient:
+        ch = None
+    if ch is None:
         return None
-    member = await _ficha_member(guild, discord_id)
-    return channel if _ficha_channel_ok(channel, member, guild.me) else None
+    return {"id": str(ch.id), "name": getattr(ch, "name", "?"),
+            "guild": getattr(getattr(ch, "guild", None), "name", "")}
 
 
-async def _ficha_list_channels(discord_id: str) -> list[dict]:
-    out = []
-    for guild in sorted(bot.guilds, key=lambda g: g.name.lower()):
-        if not _ficha_guild_ok(guild):
-            continue
-        member = await _ficha_member(guild, discord_id)
-        if member is None:
-            continue
-        for ch in sorted(guild.text_channels, key=lambda c: (c.position, c.id)):
-            if _ficha_channel_ok(ch, member, guild.me):
-                out.append({"id": str(ch.id), "name": ch.name, "guild": guild.name, "guild_id": str(guild.id)})
-                if len(out) >= 200:
-                    return out
-    return out
+async def _ficha_link_info(binding: dict) -> dict:
+    """A ligação como a ficha a mostra: {id, name, guild, usable}; nome e servidor vêm do Discord quando dá."""
+    try:
+        ch = await _ficha_resolve_quiet(int(binding["channel"]))
+        usable = ch is not None and await _ficha_can_post(ch, binding["by"])
+    except FichaDiscordTransient:
+        ch, usable = None, True  # não deu para saber agora: não assusta a ficha com "não aceita mais"
+    guild = getattr(ch, "guild", None)
+    return {"id": binding["channel"],
+            "name": getattr(ch, "name", None) or binding["channel"],
+            "guild": getattr(guild, "name", None) or str(binding.get("guild") or ""),
+            "usable": usable}
 
 
-async def _handle_ficha_channels(request: web.Request) -> web.StreamResponse:
+def ficha_link_validate(data) -> dict:
+    """Corpo do POST /webhook/ficha-link: {action, sheet, name?}. Campos desconhecidos são ignorados."""
+    if not isinstance(data, dict):
+        raise FichaRollError("body must be a JSON object")
+    action = data.get("action")
+    if not isinstance(action, str) or action not in FICHA_LINK_ACTIONS:
+        raise FichaRollError(f"action must be one of {list(FICHA_LINK_ACTIONS)}")
+    sheet = _ficha_sheet_field(data.get("sheet"))
+    if sheet is None:
+        raise FichaRollError("sheet is required")
+    return {"action": action, "sheet": sheet,
+            "name": _ficha_text(data.get("name"), "name", max_len=FICHA_LINK_NAME_MAX)}
+
+
+async def _handle_ficha_link(request: web.Request) -> web.StreamResponse:
     token = bearer_token(request.headers.get("Authorization"))
     if token is None:
         return _json_err(401, "unauthorized")
+    raw = await _read_limited(request, FICHA_LINK_MAX_BODY)
+    if raw is None:
+        return _json_err(413, "payload_too_large")
+    try:
+        body = ficha_link_validate(json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant))
+    except FichaRollError as e:
+        return _json_err(400, "invalid_payload", detail=str(e))
+    except (ValueError, UnicodeDecodeError):
+        return _json_err(400, "invalid_payload", detail="invalid JSON")
     try:
         uid = await _ficha_auth(token, _client_key(request))
     except FichaAuthError as e:
         if e.status == 429:
             return _rate_limited(e.retry_after)
         return _json_err(e.status, e.code)
-    wait = _ficha_channels_limiter.hit(uid)
+    wait = _ficha_link_limiter.hit(uid)
     if wait:
         return _rate_limited(wait)
+    sheet = body["sheet"]
+    if body["action"] == "code":
+        code = ficha_link_new_code(uid, sheet, body["name"])
+        if code is None:
+            logging.warning("ficha-link: %d pending codes — refusing new ones", len(_ficha_link_codes))
+            return _json_err(503, "busy")
+        return web.json_response({"ok": True, "code": code, "expires_in": FICHA_LINK_CODE_TTL})
     await ready_event.wait()
-    try:
-        discord_id = await _ficha_discord_id(token)
-    except FichaLookupError:
-        return _json_err(503, "lookup_unavailable")
-    default_id, _ = ficha_target_channel_id(None)
-    default_ch = await _ficha_resolve_quiet(default_id)
-    default = ({"id": str(default_ch.id), "name": getattr(default_ch, "name", "?"),
-                "guild": getattr(getattr(default_ch, "guild", None), "name", "")} if default_ch else None)
-    if not discord_id:
-        return web.json_response({"ok": True, "linked": False, "default": default, "channels": []})
-    return web.json_response({"ok": True, "linked": True, "default": default,
-                              "channels": await _ficha_list_channels(discord_id)})
+    if body["action"] == "unlink":
+        ficha_link_unlink(uid, sheet)
+        return web.json_response({"ok": True, "linked": None, "pending": False, "default": await _ficha_default_info()})
+    binding = ficha_link_binding(uid, sheet)
+    return web.json_response({"ok": True,
+                              "linked": await _ficha_link_info(binding) if binding else None,
+                              "pending": ficha_link_pending(uid, sheet),
+                              "default": await _ficha_default_info()})
 
 
 async def _ficha_send_default(payload: dict):
     """Envia no canal padrão. Devolve (msg, canal) ou uma web.Response de erro."""
     global _ficha_roll_channel
-    default_id, _ = ficha_target_channel_id(None)
+    default_id, _ = ficha_target_channel_id()
     if _ficha_roll_channel is not None and getattr(_ficha_roll_channel, "id", None) != default_id:
         _ficha_roll_channel = None  # o padrão mudou (/ficha_canal_padrao)
     channel = _ficha_roll_channel or await _resolve_channel(default_id)
@@ -2187,7 +2317,10 @@ async def _ficha_send_default(payload: dict):
 
 async def _ficha_roll_startup_check() -> None:
     """Só log: o canal padrão das rolagens existe e o bot pode escrever lá? Nunca envia nada."""
-    default_id = ficha_target_channel_id(None)[0]
+    legacy = _config.get("ficha_roll", {}).get("users")
+    if isinstance(legacy, dict) and legacy:
+        logging.info("ficha-roll: %d legacy per-player channel choices (/ficha_canal) in the config — ignored", len(legacy))
+    default_id = ficha_target_channel_id()[0]
     channel = await _resolve_channel(default_id)
     if channel is None:
         logging.warning("ficha-roll: channel %s NOT accessible — rolls will fail (503)", default_id)
@@ -2202,49 +2335,51 @@ async def _ficha_roll_startup_check() -> None:
                 getattr(channel, "name", "?"), channel.id, guild.name, perms.view_channel, perms.send_messages,
                 perms.embed_links, feature_enabled(guild.id, "ficha_roll"))
 
-# ---- Ficha Paranormal: escolher o canal das rolagens -------------------------
-def _ficha_canal_problem(channel, member, me) -> str | None:
+# ---- Ficha Paranormal: ligar uma ficha a um canal / canal padrão -------------
+FICHA_CANAL_TEXT = {  # mensagens do /ficha_canal_padrao (o /ficha_ligar usa as de FICHA_LINK_TEXT)
+    "not_text": "Escolhe um canal de texto deste servidor.",
+    "guild_not_allowed": "As rolagens da ficha não podem ir para este servidor.",
+    "private_thread": "Threads privadas não dão. Escolhe um canal ou uma thread pública.",
+    "user_cannot_post": "Tu não podes escrever em {mention}, por isso não dá para mandar as rolagens para lá.",
+    "bot_cannot_post": "Eu não consigo escrever em {mention} (preciso de ver o canal, enviar mensagens e inserir links).",
+    "disabled": "As rolagens da ficha estão desativadas neste servidor.",
+}
+FICHA_LINK_CHANNEL_TYPES = (discord.ChannelType.text, discord.ChannelType.news,
+                            discord.ChannelType.public_thread, discord.ChannelType.news_thread,
+                            discord.ChannelType.private_thread)  # privada: tem mensagem própria logo a seguir
+
+
+def _ficha_canal_problem(channel, member, me, texts: dict = FICHA_CANAL_TEXT) -> str | None:
     """O canal serve? A pessoa tem que poder ver e escrever lá, e o bot também (com embeds)."""
-    if channel is None or getattr(channel, "guild", None) is None:
-        return "Escolhe um canal de texto deste servidor."
+    if (channel is None or getattr(channel, "guild", None) is None or me is None
+            or getattr(channel, "type", None) not in FICHA_LINK_CHANNEL_TYPES):
+        return texts["not_text"]
     if FICHA_GUILD_IDS and channel.guild.id not in FICHA_GUILD_IDS:
-        return "As rolagens da ficha não podem ir para este servidor."
-    if getattr(channel, "type", None) == discord.ChannelType.private_thread:
-        return "Threads privadas não dão. Escolhe um canal ou uma thread pública."
+        return texts["guild_not_allowed"]
+    if channel.type == discord.ChannelType.private_thread:
+        return texts["private_thread"]
     mine = channel.permissions_for(member)
     if not (mine.view_channel and (mine.send_messages_in_threads if isinstance(channel, discord.Thread) else mine.send_messages)):
-        return f"Tu não podes escrever em {channel.mention}, por isso não dá para mandar as rolagens para lá."
+        return texts["user_cannot_post"].format(mention=channel.mention)
     bot_p = channel.permissions_for(me)
     if not (bot_p.view_channel and bot_p.embed_links and
             (bot_p.send_messages_in_threads if isinstance(channel, discord.Thread) else bot_p.send_messages)):
-        return f"Eu não consigo escrever em {channel.mention} (preciso de ver o canal, enviar mensagens e inserir links)."
+        return texts["bot_cannot_post"].format(mention=channel.mention)
     if not feature_enabled(channel.guild.id, "ficha_roll"):
-        return "As rolagens da ficha estão desativadas neste servidor."
+        return texts["disabled"]
     return None
 
 
-@bot.tree.command(name="ficha_canal", description="Escolher o canal onde aparecem as tuas rolagens da ficha (Ordem 1 e Ordem 2)")
+@bot.tree.command(name="ficha_ligar", description=FICHA_LINK_TEXT["command"])
 @app_commands.guild_only()
-@app_commands.describe(canal="O canal das rolagens. Sem escolher, fica este canal.")
-async def ficha_canal_slash(interaction: discord.Interaction,
-                            canal: discord.TextChannel | discord.Thread | None = None):
-    channel = canal or interaction.channel
-    problem = _ficha_canal_problem(channel, interaction.user, interaction.guild.me if interaction.guild else None)
-    if problem:
-        await interaction.response.send_message(problem, ephemeral=True)
-        return
-    ficha_set_channel(str(interaction.user.id), channel.id, interaction.guild_id)
-    await interaction.response.send_message(
-        f"✅ As tuas rolagens do site (Ordem 1 e Ordem 2) vão aparecer em {channel.mention}.\n"
-        "-# Funciona com a conta que ligaste no `/ficha_convite`. Para voltar ao canal de sempre: `/ficha_canal_limpar`.",
-        ephemeral=True)
-
-
-@bot.tree.command(name="ficha_canal_limpar", description="As tuas rolagens da ficha voltam para o canal de sempre")
-async def ficha_canal_limpar_slash(interaction: discord.Interaction):
-    ficha_set_channel(str(interaction.user.id), None)
-    target, _ = ficha_target_channel_id(None)
-    await interaction.response.send_message(f"Feito. As tuas rolagens voltam para <#{target}>.", ephemeral=True)
+@app_commands.describe(codigo=FICHA_LINK_TEXT["option"])
+async def ficha_ligar_slash(interaction: discord.Interaction, codigo: str):
+    ok, text = ficha_link_consume(codigo, interaction.channel, interaction.user,
+                                  interaction.guild.me if interaction.guild else None)
+    if ok:
+        logging.info("ficha-link: sheet linked to channel %s by %s", interaction.channel_id, interaction.user.id)
+    await interaction.response.send_message(text, ephemeral=not ok, allowed_mentions=discord.AllowedMentions.none(),
+                                            suppress_embeds=True)
 
 
 @bot.tree.command(name="ficha_canal_padrao", description="(Dono do bot) Canal das rolagens de quem não escolheu nenhum")
@@ -2260,7 +2395,7 @@ async def ficha_canal_padrao_slash(interaction: discord.Interaction,
     if problem:
         await interaction.response.send_message(problem, ephemeral=True)
         return
-    ficha_set_channel(None, channel.id)
+    ficha_set_default_channel(channel.id)
     await interaction.response.send_message(
         f"✅ Rolagens de quem não escolheu canal vão para {channel.mention}.", ephemeral=True)
 
@@ -2295,9 +2430,8 @@ Bot da campanha — dados, missões, countdowns e agendamento de sessões.
 
 ## 🕵️ Ficha Paranormal
 - `/ficha_convite <email>` — Libera o teu e-mail no site da ficha (ordemcodex.xyz). Resposta só para ti · um e-mail por pessoa
-- `/ficha_canal [canal]` — Escolhe onde aparecem as tuas rolagens do site (Ordem 1 e Ordem 2). Sem canal, fica este
-- `/ficha_canal_limpar` — As tuas rolagens voltam para o canal de sempre
-- `/ficha_canal_padrao [canal]` — 🔒 Dono do bot: canal de quem não escolheu nenhum
+- `/ficha_ligar <codigo>` — Liga uma ficha do site a este canal: as rolagens dela aparecem aqui. O código está na ficha, em **Ligar a um canal** (vale 10 min)
+- `/ficha_canal_padrao [canal]` — 🔒 Dono do bot: canal das fichas que não estão ligadas a nenhum
 
 ## 🛠️ Utilidades
 - `!config` 🔒 — Liga/desliga funções neste servidor. Ex.: `!config disable roll` (também `/config`)
