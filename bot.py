@@ -412,7 +412,7 @@ async def _cors_middleware(request: web.Request, handler):
         resp = web.Response(status=204)
     else:
         resp = await handler(request)
-    if request.path == FICHA_ROLL_PATH:
+    if request.path in (FICHA_ROLL_PATH, FICHA_CHANNELS_PATH):
         # rolagens da ficha: só o site (lista fechada) e com o header Authorization
         origin = request.headers.get("Origin", "")
         if origin in FICHA_ROLL_ORIGINS:
@@ -435,6 +435,7 @@ async def _ensure_webhook_server():
         web.post("/webhook/broadcast", _handle_broadcast),
         web.post("/webhook/preset", _handle_preset),
         web.post(FICHA_ROLL_PATH, _handle_ficha_roll),
+        web.post(FICHA_CHANNELS_PATH, _handle_ficha_channels),
         web.route("OPTIONS", "/{tail:.*}", _handle_options),
     ])
     runner = web.AppRunner(app)
@@ -1431,12 +1432,14 @@ async def ficha_convite_slash(interaction: discord.Interaction, email: str):
 # O site (ordemcodex.xyz) manda cada rolagem para POST /webhook/ficha-roll com o access token do Supabase do
 # jogador (Authorization: Bearer …). Sem segredo partilhado no browser: o bot confirma o token no Supabase
 # (/auth/v1/user) e que a conta está na lista de convidados (rpc ficha_paranormal.am_i_allowed), e só então posta
-# um embed no canal FICHA_ROLL_CHANNEL_ID. Por agora o canal é fixo; mais tarde escolhe-se por DM.
+# um embed no canal escolhido: o do jogador (/ficha_canal, pela conta do Discord ligada no /ficha_convite), senão o
+# padrão (/ficha_canal_padrao, só o dono do bot), senão FICHA_ROLL_CHANNEL_ID. Vale para Ordem 1 e Ordem 2.
 import hashlib
 import base64
 from collections import deque
 
 FICHA_ROLL_PATH = "/webhook/ficha-roll"
+FICHA_CHANNELS_PATH = "/webhook/ficha-channels"  # a ficha lista os canais onde o jogador pode mandar as rolagens
 FICHA_ROLL_CHANNEL_ID = int(os.getenv("FICHA_ROLL_CHANNEL_ID", "1165819468354687066"))
 FICHA_ROLL_ORIGINS = frozenset(
     o.strip().rstrip("/") for o in os.getenv(
@@ -1602,7 +1605,17 @@ def _op2_validate(data: dict) -> dict:
         "damage": _ficha_damage(data.get("damage")),
         "extra": _ficha_text(data.get("extra"), "extra"),
         "followUp": _ficha_text(data.get("followUp"), "followUp"),
+        "channel": _ficha_channel_field(data.get("channel")),
     }
+
+
+def _ficha_channel_field(value) -> str | None:
+    """Canal escolhido na ficha (id do Discord, só dígitos) ou None."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not value.isdigit() or len(value) > 20:
+        raise FichaRollError("channel must be a Discord channel id")
+    return value
 
 
 def ficha_roll_validate(data) -> dict:
@@ -1624,6 +1637,7 @@ def ficha_roll_validate(data) -> dict:
         "attack": None,
         "damage": None,
         "extra": _ficha_text(data.get("extra"), "extra"),
+        "channel": _ficha_channel_field(data.get("channel")),
     }
     attack = data.get("attack")
     if attack is not None:
@@ -1775,10 +1789,44 @@ class FichaAuthError(Exception):
 _ficha_auth_cache: dict[str, tuple[str, float]] = {}  # sha256(token) → (user_id, expira_em epoch)
 _ficha_auth_neg_cache: dict[str, float] = {}          # sha256(token) → expira_em epoch (token recusado, 401)
 _ficha_roll_limiter = SlidingWindowLimiter(*FICHA_ROLL_RATE)
+_ficha_channels_limiter = SlidingWindowLimiter(6, 60.0)  # a ficha pede a lista ao abrir o seletor
 _ficha_auth_limiter = SlidingWindowLimiter(*FICHA_ROLL_AUTH_RATE)
 _ficha_auth_global_limiter = SlidingWindowLimiter(*FICHA_ROLL_AUTH_GLOBAL_RATE)
 _ficha_http: aiohttp.ClientSession | None = None
-_ficha_roll_channel = None
+_ficha_roll_channel = None  # cache do canal PADRÃO (os canais de cada jogador são resolvidos a cada vez)
+_ficha_discord_cache: dict[str, tuple[str | None, float]] = {}  # sha256(token) → (id do Discord ligado, expira_em)
+
+
+def _ficha_channels() -> dict:
+    """Escolhas de canal guardadas no guild_config.json (mesmo volume): {"default": id|None, "users": {discord_id: {...}}}."""
+    cfg = _config.setdefault("ficha_roll", {})
+    if not isinstance(cfg.get("users"), dict):
+        cfg["users"] = {}
+    cfg.setdefault("default", None)
+    return cfg
+
+
+def ficha_target_channel_id(discord_id: str | None) -> tuple[int, str]:
+    """Canal da rolagem e de onde veio: ("user" | "default" | "env"). Puro, sem Discord."""
+    cfg = _ficha_channels()
+    pref = cfg["users"].get(str(discord_id)) if discord_id else None
+    if isinstance(pref, dict) and str(pref.get("channel", "")).isdigit():
+        return int(pref["channel"]), "user"
+    if str(cfg.get("default") or "").isdigit():
+        return int(cfg["default"]), "default"
+    return FICHA_ROLL_CHANNEL_ID, "env"
+
+
+def ficha_set_channel(discord_id: str | None, channel_id: int | None, guild_id: int | None = None) -> None:
+    """discord_id None = canal padrão. channel_id None = apaga a escolha."""
+    cfg = _ficha_channels()
+    if discord_id is None:
+        cfg["default"] = str(channel_id) if channel_id else None
+    elif channel_id is None:
+        cfg["users"].pop(str(discord_id), None)
+    else:
+        cfg["users"][str(discord_id)] = {"channel": str(channel_id), "guild": str(guild_id or "")}
+    _save_config()
 
 
 def _ficha_http_session() -> aiohttp.ClientSession:
@@ -1826,6 +1874,42 @@ async def _ficha_check_token(token: str) -> str:
     if not ok:
         raise FichaAuthError(403, "not_allowed")
     return uid
+
+
+class FichaLookupError(Exception):
+    """A consulta da conta ligada falhou (rede, 5xx, função em falta): não é o mesmo que "não ligada"."""
+
+
+async def _ficha_lookup_discord_id(token: str) -> str | None:
+    """Conta do Discord ligada a esta conta do site (rpc my_discord_user_id): o id, ou None se não está ligada.
+    Levanta FichaLookupError se não deu para saber."""
+    headers = {"apikey": FICHA_SUPABASE_KEY, "Authorization": f"Bearer {token}",
+               "Content-Type": "application/json", "Content-Profile": "ficha_paranormal"}
+    try:
+        async with _ficha_http_session().post(f"{FICHA_SUPABASE_URL}/rest/v1/rpc/my_discord_user_id",
+                                              headers=headers, json={}) as r:
+            if r.status != 200:
+                raise FichaLookupError(r.status)
+            value = await r.json(content_type=None)
+            return value if isinstance(value, str) and value.isdigit() else None
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        raise FichaLookupError(type(e).__name__)
+
+
+async def _ficha_discord_id(token: str) -> str | None:
+    """Com cache como o da autenticação (o token já foi confirmado antes de chegar aqui). Só guarda respostas
+    de verdade; se a consulta falhar levanta FichaLookupError, sem cache."""
+    key = hashlib.sha256(token.encode()).hexdigest()
+    now = time.time()
+    cached = _ficha_discord_cache.get(key)
+    if cached and cached[1] > now:
+        return cached[0]
+    did = await _ficha_lookup_discord_id(token)
+    exp = _jwt_exp(token)
+    expires = min(now + FICHA_ROLL_AUTH_TTL, exp) if exp is not None else now + FICHA_ROLL_AUTH_TTL
+    if expires > now:
+        _bounded_put(_ficha_discord_cache, key, (did, expires), now, lambda v: v[1])
+    return did
 
 
 def _bounded_put(cache: dict, key: str, value, now: float, expiry_of, max_size: int = 1000) -> None:
@@ -1935,8 +2019,154 @@ async def _handle_ficha_roll(request: web.Request) -> web.StreamResponse:
         return _rate_limited(wait)
 
     await ready_event.wait()
+    try:
+        discord_id = await _ficha_discord_id(token)
+        lookup_failed = False
+    except FichaLookupError as e:
+        logging.warning("ficha-roll: linked-account lookup failed (%s) — using the default channel", e)
+        discord_id, lookup_failed = None, True
+    target, source = ficha_target_channel_id(discord_id)
+    msg = channel = None
+    if payload.get("channel") and not lookup_failed:
+        # escolhido na ficha: só se a conta do Discord ligada pode escrever lá (senão nada é postado)
+        channel = await _ficha_member_channel(discord_id, int(payload["channel"]))
+        if channel is None:
+            return _json_err(403, "channel_not_allowed")
+        try:
+            msg = await channel.send(embed=ficha_roll_embed(payload), allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as e:
+            logging.warning("ficha-roll: chosen channel %s refused send (%s)", channel.id, e.status)
+            return _json_err(502, "discord_error")
+    elif source == "user":
+        # a escolha do /ficha_canal é verificada de novo a cada rolagem (saiu do servidor, perdeu permissão…)
+        channel = await _ficha_member_channel(discord_id, target)
+        if channel is not None:
+            try:
+                msg = await channel.send(embed=ficha_roll_embed(payload), allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException as e:
+                logging.warning("ficha-roll: player channel %s refused send (%s) — using the default", target, e.status)
+                msg = None
+        else:
+            logging.warning("ficha-roll: player channel %s unavailable — using the default", target)
+    if msg is None:
+        resp = await _ficha_send_default(payload)
+        if isinstance(resp, web.Response):
+            return resp
+        msg, channel = resp
+    logging.info("ficha-roll: user=%s kind=%s channel=%s → msg %s", uid, payload["kind"], channel.id, msg.id)
+    return web.json_response({"ok": True, "message_id": str(msg.id), "channel_id": str(channel.id)})
+
+
+_ficha_member_cache: dict[tuple[int, str], tuple[object, float]] = {}  # (guild, discord id) → (membro|None, expira)
+
+
+async def _ficha_member(guild, discord_id: str):
+    """O membro no servidor (sem intent de membros: fetch, com cache de 60 s). None se não está lá."""
+    key, now = (guild.id, discord_id), time.time()
+    hit = _ficha_member_cache.get(key)
+    if hit and hit[1] > now:
+        return hit[0]
+    member = guild.get_member(int(discord_id))
+    if member is None:
+        try:
+            member = await guild.fetch_member(int(discord_id))
+        except (discord.NotFound, discord.Forbidden):
+            member = None
+        except discord.HTTPException:
+            return None  # sem cache: tenta de novo da próxima vez
+    _bounded_put(_ficha_member_cache, key, (member, now + 60), now, lambda v: v[1])
+    return member
+
+
+def _ficha_channel_ok(channel, member, me) -> bool:
+    if channel is None or member is None or me is None:
+        return False
+    if getattr(channel, "type", None) == discord.ChannelType.private_thread:
+        return False  # o discord.py não vê quem está numa thread privada
+    thread = isinstance(channel, discord.Thread)
+    mine, bots = channel.permissions_for(member), channel.permissions_for(me)
+    return (mine.view_channel and (mine.send_messages_in_threads if thread else mine.send_messages)
+            and bots.view_channel and bots.embed_links and (bots.send_messages_in_threads if thread else bots.send_messages))
+
+
+def _ficha_guild_ok(guild) -> bool:
+    return (not FICHA_GUILD_IDS or guild.id in FICHA_GUILD_IDS) and feature_enabled(guild.id, "ficha_roll")
+
+
+async def _ficha_resolve_quiet(channel_id: int):
+    """Como _resolve_channel, sem stack trace no log (os ids vêm de fora e podem não existir)."""
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(channel_id)
+        except discord.HTTPException:
+            return None
+    return ch
+
+
+async def _ficha_member_channel(discord_id: str | None, channel_id: int):
+    """O canal, se a conta do Discord ligada pode escrever nele; senão None."""
+    if not discord_id:
+        return None
+    channel = await _ficha_resolve_quiet(channel_id)
+    guild = getattr(channel, "guild", None)
+    if guild is None or not _ficha_guild_ok(guild):
+        return None
+    member = await _ficha_member(guild, discord_id)
+    return channel if _ficha_channel_ok(channel, member, guild.me) else None
+
+
+async def _ficha_list_channels(discord_id: str) -> list[dict]:
+    out = []
+    for guild in sorted(bot.guilds, key=lambda g: g.name.lower()):
+        if not _ficha_guild_ok(guild):
+            continue
+        member = await _ficha_member(guild, discord_id)
+        if member is None:
+            continue
+        for ch in sorted(guild.text_channels, key=lambda c: (c.position, c.id)):
+            if _ficha_channel_ok(ch, member, guild.me):
+                out.append({"id": str(ch.id), "name": ch.name, "guild": guild.name, "guild_id": str(guild.id)})
+                if len(out) >= 200:
+                    return out
+    return out
+
+
+async def _handle_ficha_channels(request: web.Request) -> web.StreamResponse:
+    token = bearer_token(request.headers.get("Authorization"))
+    if token is None:
+        return _json_err(401, "unauthorized")
+    try:
+        uid = await _ficha_auth(token, _client_key(request))
+    except FichaAuthError as e:
+        if e.status == 429:
+            return _rate_limited(e.retry_after)
+        return _json_err(e.status, e.code)
+    wait = _ficha_channels_limiter.hit(uid)
+    if wait:
+        return _rate_limited(wait)
+    await ready_event.wait()
+    try:
+        discord_id = await _ficha_discord_id(token)
+    except FichaLookupError:
+        return _json_err(503, "lookup_unavailable")
+    default_id, _ = ficha_target_channel_id(None)
+    default_ch = await _ficha_resolve_quiet(default_id)
+    default = ({"id": str(default_ch.id), "name": getattr(default_ch, "name", "?"),
+                "guild": getattr(getattr(default_ch, "guild", None), "name", "")} if default_ch else None)
+    if not discord_id:
+        return web.json_response({"ok": True, "linked": False, "default": default, "channels": []})
+    return web.json_response({"ok": True, "linked": True, "default": default,
+                              "channels": await _ficha_list_channels(discord_id)})
+
+
+async def _ficha_send_default(payload: dict):
+    """Envia no canal padrão. Devolve (msg, canal) ou uma web.Response de erro."""
     global _ficha_roll_channel
-    channel = _ficha_roll_channel or await _resolve_channel(FICHA_ROLL_CHANNEL_ID)
+    default_id, _ = ficha_target_channel_id(None)
+    if _ficha_roll_channel is not None and getattr(_ficha_roll_channel, "id", None) != default_id:
+        _ficha_roll_channel = None  # o padrão mudou (/ficha_canal_padrao)
+    channel = _ficha_roll_channel or await _resolve_channel(default_id)
     if channel is None:
         return _json_err(503, "channel_unavailable")
     _ficha_roll_channel = channel
@@ -1947,30 +2177,92 @@ async def _handle_ficha_roll(request: web.Request) -> web.StreamResponse:
         msg = await channel.send(embed=ficha_roll_embed(payload), allowed_mentions=discord.AllowedMentions.none())
     except (discord.NotFound, discord.Forbidden) as e:
         _ficha_roll_channel = None  # canal apagado / sem permissão: volta a resolver no próximo pedido
-        logging.warning("ficha-roll: channel %s refused send (%s) — cache cleared", FICHA_ROLL_CHANNEL_ID, e.status)
+        logging.warning("ficha-roll: channel %s refused send (%s) — cache cleared", default_id, e.status)
         return _json_err(502, "discord_error")
     except discord.HTTPException as e:
         logging.warning("ficha-roll: Discord send failed (%s)", e.status)
         return _json_err(502, "discord_error")
-    logging.info("ficha-roll: user=%s kind=%s → msg %s", uid, payload["kind"], msg.id)
-    return web.json_response({"ok": True, "message_id": str(msg.id), "channel_id": str(channel.id)})
+    return msg, channel
 
 
 async def _ficha_roll_startup_check() -> None:
-    """Só log: o canal das rolagens existe e o bot pode escrever lá? Nunca envia nada."""
-    channel = await _resolve_channel(FICHA_ROLL_CHANNEL_ID)
+    """Só log: o canal padrão das rolagens existe e o bot pode escrever lá? Nunca envia nada."""
+    default_id = ficha_target_channel_id(None)[0]
+    channel = await _resolve_channel(default_id)
     if channel is None:
-        logging.warning("ficha-roll: channel %s NOT accessible — rolls will fail (503)", FICHA_ROLL_CHANNEL_ID)
+        logging.warning("ficha-roll: channel %s NOT accessible — rolls will fail (503)", default_id)
         return
     guild = getattr(channel, "guild", None)
     if guild is None or guild.me is None:
-        logging.warning("ficha-roll: channel %s is not a guild channel", FICHA_ROLL_CHANNEL_ID)
+        logging.warning("ficha-roll: channel %s is not a guild channel", default_id)
         return
     perms = channel.permissions_for(guild.me)
     level = logging.INFO if (perms.view_channel and perms.send_messages and perms.embed_links) else logging.WARNING
     logging.log(level, "ficha-roll: channel #%s (%s) in %s — view=%s send_messages=%s embed_links=%s ficha_roll_enabled=%s",
                 getattr(channel, "name", "?"), channel.id, guild.name, perms.view_channel, perms.send_messages,
                 perms.embed_links, feature_enabled(guild.id, "ficha_roll"))
+
+# ---- Ficha Paranormal: escolher o canal das rolagens -------------------------
+def _ficha_canal_problem(channel, member, me) -> str | None:
+    """O canal serve? A pessoa tem que poder ver e escrever lá, e o bot também (com embeds)."""
+    if channel is None or getattr(channel, "guild", None) is None:
+        return "Escolhe um canal de texto deste servidor."
+    if FICHA_GUILD_IDS and channel.guild.id not in FICHA_GUILD_IDS:
+        return "As rolagens da ficha não podem ir para este servidor."
+    if getattr(channel, "type", None) == discord.ChannelType.private_thread:
+        return "Threads privadas não dão. Escolhe um canal ou uma thread pública."
+    mine = channel.permissions_for(member)
+    if not (mine.view_channel and (mine.send_messages_in_threads if isinstance(channel, discord.Thread) else mine.send_messages)):
+        return f"Tu não podes escrever em {channel.mention}, por isso não dá para mandar as rolagens para lá."
+    bot_p = channel.permissions_for(me)
+    if not (bot_p.view_channel and bot_p.embed_links and
+            (bot_p.send_messages_in_threads if isinstance(channel, discord.Thread) else bot_p.send_messages)):
+        return f"Eu não consigo escrever em {channel.mention} (preciso de ver o canal, enviar mensagens e inserir links)."
+    if not feature_enabled(channel.guild.id, "ficha_roll"):
+        return "As rolagens da ficha estão desativadas neste servidor."
+    return None
+
+
+@bot.tree.command(name="ficha_canal", description="Escolher o canal onde aparecem as tuas rolagens da ficha (Ordem 1 e Ordem 2)")
+@app_commands.guild_only()
+@app_commands.describe(canal="O canal das rolagens. Sem escolher, fica este canal.")
+async def ficha_canal_slash(interaction: discord.Interaction,
+                            canal: discord.TextChannel | discord.Thread | None = None):
+    channel = canal or interaction.channel
+    problem = _ficha_canal_problem(channel, interaction.user, interaction.guild.me if interaction.guild else None)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    ficha_set_channel(str(interaction.user.id), channel.id, interaction.guild_id)
+    await interaction.response.send_message(
+        f"✅ As tuas rolagens do site (Ordem 1 e Ordem 2) vão aparecer em {channel.mention}.\n"
+        "-# Funciona com a conta que ligaste no `/ficha_convite`. Para voltar ao canal de sempre: `/ficha_canal_limpar`.",
+        ephemeral=True)
+
+
+@bot.tree.command(name="ficha_canal_limpar", description="As tuas rolagens da ficha voltam para o canal de sempre")
+async def ficha_canal_limpar_slash(interaction: discord.Interaction):
+    ficha_set_channel(str(interaction.user.id), None)
+    target, _ = ficha_target_channel_id(None)
+    await interaction.response.send_message(f"Feito. As tuas rolagens voltam para <#{target}>.", ephemeral=True)
+
+
+@bot.tree.command(name="ficha_canal_padrao", description="(Dono do bot) Canal das rolagens de quem não escolheu nenhum")
+@app_commands.guild_only()
+@app_commands.describe(canal="O canal padrão. Sem escolher, fica este canal.")
+async def ficha_canal_padrao_slash(interaction: discord.Interaction,
+                                   canal: discord.TextChannel | discord.Thread | None = None):
+    if not await bot.is_owner(interaction.user):
+        await interaction.response.send_message("Só o dono do bot pode mudar o canal padrão.", ephemeral=True)
+        return
+    channel = canal or interaction.channel
+    problem = _ficha_canal_problem(channel, interaction.user, interaction.guild.me if interaction.guild else None)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    ficha_set_channel(None, channel.id)
+    await interaction.response.send_message(
+        f"✅ Rolagens de quem não escolheu canal vão para {channel.mention}.", ephemeral=True)
 
 # ---- ajuda / manual ---------------------------------------------------------
 # Compact Avrae-style command reference, grouped by category.
@@ -2003,6 +2295,9 @@ Bot da campanha — dados, missões, countdowns e agendamento de sessões.
 
 ## 🕵️ Ficha Paranormal
 - `/ficha_convite <email>` — Libera o teu e-mail no site da ficha (ordemcodex.xyz). Resposta só para ti · um e-mail por pessoa
+- `/ficha_canal [canal]` — Escolhe onde aparecem as tuas rolagens do site (Ordem 1 e Ordem 2). Sem canal, fica este
+- `/ficha_canal_limpar` — As tuas rolagens voltam para o canal de sempre
+- `/ficha_canal_padrao [canal]` — 🔒 Dono do bot: canal de quem não escolheu nenhum
 
 ## 🛠️ Utilidades
 - `!config` 🔒 — Liga/desliga funções neste servidor. Ex.: `!config disable roll` (também `/config`)

@@ -205,7 +205,7 @@ def test_other_kinds_keep_their_shape_next_to_op2():
     # dice continua a ser texto nos kinds antigos, e o array do op2 não entra por lá
     expect_error({**BASE, "dice": [die()]}, "dice must be a string")
     p = B.ficha_roll_validate(BASE)
-    assert set(p) == {"agent", "title", "kind", "notation", "dice", "total", "attack", "damage", "extra"}
+    assert set(p) == {"agent", "title", "kind", "notation", "dice", "total", "attack", "damage", "extra", "channel"}
     assert B.ficha_roll_embed(p).footer.text == "ordemcodex.xyz"
 
 
@@ -359,6 +359,34 @@ class _FakeChannel:
         return _FakeMsg()
 
 
+def test_channel_checks_are_real():
+    P = lambda **k: types.SimpleNamespace(view_channel=True, send_messages=True, send_messages_in_threads=True,
+                                          embed_links=True, **{**{}, **k})
+    class Ch:
+        type = discord.ChannelType.text
+        def __init__(self, member_p, bot_p):
+            self.p = {"m": member_p, "b": bot_p}
+        def permissions_for(self, who):
+            return self.p[who]
+    assert B._ficha_channel_ok(Ch(P(), P()), "m", "b")
+    assert not B._ficha_channel_ok(Ch(types.SimpleNamespace(view_channel=True, send_messages=False,
+                                                          send_messages_in_threads=False, embed_links=True), P()), "m", "b")
+    assert not B._ficha_channel_ok(Ch(P(), types.SimpleNamespace(view_channel=True, send_messages=True,
+                                                               send_messages_in_threads=True, embed_links=False)), "m", "b")
+    priv = Ch(P(), P()); priv.type = discord.ChannelType.private_thread
+    assert not B._ficha_channel_ok(priv, "m", "b")
+    assert not B._ficha_channel_ok(None, "m", "b") and not B._ficha_channel_ok(Ch(P(), P()), None, "b")
+    g = types.SimpleNamespace(id=5)
+    old = B.FICHA_GUILD_IDS
+    try:
+        B.FICHA_GUILD_IDS = {9}
+        assert not B._ficha_guild_ok(g)
+        B.FICHA_GUILD_IDS = set()
+        assert B._ficha_guild_ok(g)
+    finally:
+        B.FICHA_GUILD_IDS = old
+
+
 async def _run_handler_tests():
     calls = {"n": 0}
 
@@ -370,16 +398,32 @@ async def _run_handler_tests():
             raise B.FichaAuthError(403, "not_allowed")
         return "user-" + token[-4:]
 
-    orig_check, orig_resolve = B._ficha_check_token, B._resolve_channel
+    orig = (B._ficha_check_token, B._resolve_channel, B._ficha_lookup_discord_id, B._ficha_member_channel,
+            B._ficha_list_channels, B._save_config, B._ficha_resolve_quiet)
     B._ficha_check_token = fake_check
     fake = _FakeChannel()
     resolves = {"n": 0}
+    player = _FakeChannel()
+    player.id = 777
 
     async def fake_resolve(cid):
         resolves["n"] += 1
-        return fake
+        return player if cid == 777 else fake
+
+    async def fake_did(token):
+        return "555" if token.endswith("linked") and not token.endswith("unlinked") else None
+
+    async def fake_member_channel(did, cid):
+        return player if (did == "555" and cid == 777) else None
+
+    async def fake_list(did):
+        return [{"id": "777", "name": "mesa", "guild": "AKRASIA", "guild_id": "1"}]
+    B._ficha_lookup_discord_id, B._ficha_member_channel, B._ficha_list_channels = fake_did, fake_member_channel, fake_list
+    B._save_config = lambda: None
+    saved_cfg = B._config.pop("ficha_roll", None)
 
     B._resolve_channel = fake_resolve
+    B._ficha_resolve_quiet = fake_resolve
     B._ficha_roll_channel = None
     B.ready_event.set()
 
@@ -392,6 +436,7 @@ async def _run_handler_tests():
 
     app = web.Application(middlewares=[B._cors_middleware])
     app.add_routes([web.post(B.FICHA_ROLL_PATH, B._handle_ficha_roll),
+                    web.post(B.FICHA_CHANNELS_PATH, B._handle_ficha_channels),
                     web.post("/webhook/roll", lambda r: web.json_response({"x": 1})),
                     web.route("OPTIONS", "/{tail:.*}", B._handle_options)])
     client = TestClient(TestServer(app))
@@ -532,9 +577,76 @@ async def _run_handler_tests():
         B.set_feature(999, "ficha_roll", True)
         r = await client.post(B.FICHA_ROLL_PATH, json=BASE, headers=H())
         assert r.status == 200, "disabling invites must not disable rolls"
+        # --- canais: escolhido na ficha (verificado), /ficha_canal, padrão
+        def again():
+            reset(); B._ficha_discord_cache.clear()
+        again()
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "777"}, headers=H("a.b.xlinked"))
+        assert r.status == 200 and (await r.json())["channel_id"] == "777" and player.sent
+        again()
+        n = len(player.sent) + len(fake.sent)
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "999"}, headers=H("a.b.xlinked"))
+        assert r.status == 403 and (await r.json())["error"] == "channel_not_allowed"
+        again()
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "777"}, headers=H("a.b.unlinked"))
+        assert r.status == 403 and len(player.sent) + len(fake.sent) == n, "nada postado quando recusado"
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "12ab"}, headers=H("a.b.xlinked"))
+        assert r.status == 400
+        again()
+        # consulta da conta ligada falhou: nada de 403, vai para o padrão, e não fica em cache
+        async def did_down(token):
+            raise B.FichaLookupError("503")
+        B._ficha_lookup_discord_id = did_down
+        again()
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "channel": "777"}, headers=H("a.b.xlinked"))
+        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id)
+        assert not B._ficha_discord_cache
+        B._ficha_lookup_discord_id = fake_did
+        B.ficha_set_channel("555", 777, 1)
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=H("a.b.xlinked"))
+        assert r.status == 200 and (await r.json())["channel_id"] == "777"
+        again()
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=H("a.b.unlinked"))
+        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id)
+        # /ficha_canal verificado a cada rolagem: sem permissão hoje → padrão
+        B.ficha_set_channel("555", 778, 1)
+        again()
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=H("a.b.xlinked"))
+        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id)
+        B.ficha_set_channel("555", 777, 1)
+
+        async def player_forbidden(**kw):
+            raise discord.Forbidden(types.SimpleNamespace(status=403, reason="x"), "no")
+        player.send = player_forbidden
+        again()
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=H("a.b.xlinked"))
+        assert r.status == 200 and (await r.json())["channel_id"] == str(fake.id), "canal do /ficha_canal falhou → padrão"
+        del player.send
+        B.ficha_set_channel("555", None)
+        assert B.ficha_target_channel_id("555") == (B.FICHA_ROLL_CHANNEL_ID, "env")
+        B.ficha_set_channel(None, 888)
+        assert B.ficha_target_channel_id("555") == (888, "default")
+        B.ficha_set_channel(None, None)
+        again()
+        r = await client.post(B.FICHA_CHANNELS_PATH, json={}, headers=H("a.b.xlinked"))
+        body = await r.json()
+        assert r.status == 200 and body["linked"] is True and body["channels"][0]["id"] == "777", body
+        again()
+        r = await client.post(B.FICHA_CHANNELS_PATH, json={}, headers=H("a.b.unlinked"))
+        body = await r.json()
+        assert body["linked"] is False and body["channels"] == [] and body["default"]["id"] == str(fake.id), body
+        r = await client.post(B.FICHA_CHANNELS_PATH, json={})
+        assert r.status == 401
+        r = await client.options(B.FICHA_CHANNELS_PATH, headers={"Origin": "https://ordemcodex.xyz",
+                                                                 "Access-Control-Request-Method": "POST"})
+        assert r.headers.get("Access-Control-Allow-Origin") == "https://ordemcodex.xyz"
     finally:
         await client.close()
-        B._ficha_check_token, B._resolve_channel = orig_check, orig_resolve
+        (B._ficha_check_token, B._resolve_channel, B._ficha_lookup_discord_id, B._ficha_member_channel,
+         B._ficha_list_channels, B._save_config, B._ficha_resolve_quiet) = orig
+        B._config.pop("ficha_roll", None)
+        if saved_cfg is not None:
+            B._config["ficha_roll"] = saved_cfg
         B._ficha_roll_channel = None
 
 
