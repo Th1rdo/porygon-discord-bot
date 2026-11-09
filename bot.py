@@ -1437,6 +1437,9 @@ async def ficha_convite_slash(interaction: discord.Interaction, email: str):
 # escrever lá (e o bot também). A ligação fica em _config["ficha_roll"]["sheets"][uid][ficha]. Cada rolagem traz
 # `sheet`: ficha ligada → esse canal, re-verificando quem ligou e o bot (se já não dá: 403, nada é postado); ficha
 # não ligada → o padrão (/ficha_canal_padrao, só o dono do bot), senão FICHA_ROLL_CHANNEL_ID. Ordem 1 e Ordem 2.
+# Fichas do /dds (Desespero da Solidão): sem conta no site, a ficha manda `Authorization: DDS <palavra-chave>`. O bot
+# confirma a palavra no Supabase (rpc ficha_paranormal.dds_enter → id da personagem ou null) e posta sempre em
+# DDS_ROLL_CHANNEL_ID (ligações de `sheet` não contam). A palavra nunca vai para o log, só a personagem.
 import hashlib
 import base64
 import secrets
@@ -1445,6 +1448,9 @@ from collections import deque
 FICHA_ROLL_PATH = "/webhook/ficha-roll"
 FICHA_LINK_PATH = "/webhook/ficha-link"  # a ficha pede o código, vê o estado da ligação e desliga
 FICHA_ROLL_CHANNEL_ID = int(os.getenv("FICHA_ROLL_CHANNEL_ID", "1165819468354687066"))
+DDS_ROLL_CHANNEL_ID = int(os.getenv("DDS_ROLL_CHANNEL_ID", "1165819468354687066"))  # #rolagens AKRASIA
+DDS_KEY_MAX = 64                 # chars da palavra-chave do /dds
+_DDS_CHARACTER_RE = re.compile(r"^[a-z]{2,20}$")  # o mesmo check da tabela dds_sheets
 FICHA_ROLL_ORIGINS = frozenset(
     o.strip().rstrip("/") for o in os.getenv(
         "FICHA_ROLL_ORIGINS",
@@ -1828,6 +1834,23 @@ def bearer_token(header: str | None) -> str | None:
     return token
 
 
+def dds_keyword(header: str | None) -> str | None:
+    """Palavra-chave de `Authorization: DDS <palavra>` (até 64 chars, imprimíveis) ou None.
+    O aiohttp lê os headers como UTF-8 com surrogateescape; um browser que mande latin-1 (ex.: "ã" num byte só)
+    chega com surrogates — refaz-se a partir dos bytes: UTF-8 se for válido, senão latin-1."""
+    if not header or not header.startswith("DDS "):
+        return None
+    raw = header[4:].encode("utf-8", "surrogateescape")
+    try:
+        key = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        key = raw.decode("latin-1")
+    key = key.strip()
+    if not key or len(key) > DDS_KEY_MAX or not key.isprintable():
+        return None
+    return key
+
+
 class FichaAuthError(Exception):
     def __init__(self, status: int, code: str, retry_after: float = 0.0):
         super().__init__(code)
@@ -1842,7 +1865,8 @@ _ficha_link_fail_limiter = SlidingWindowLimiter(*FICHA_LINK_FAIL_RATE)  # por id
 _ficha_auth_limiter = SlidingWindowLimiter(*FICHA_ROLL_AUTH_RATE)
 _ficha_auth_global_limiter = SlidingWindowLimiter(*FICHA_ROLL_AUTH_GLOBAL_RATE)
 _ficha_http: aiohttp.ClientSession | None = None
-_ficha_roll_channel = None  # cache do canal PADRÃO (os canais das fichas ligadas são resolvidos a cada vez)
+# cache dos canais fixos: "default" (fichas não ligadas) e "dds"; os canais das fichas ligadas são resolvidos a cada vez
+_ficha_roll_channels: dict[str, object] = {}
 # Códigos do /ficha_ligar à espera, só em memória (perdem-se ao reiniciar: a ficha pede outro).
 _ficha_link_codes: dict[str, dict] = {}  # código → {"uid", "sheet", "name", "expires" (epoch)}
 
@@ -2017,10 +2041,48 @@ def _bounded_put(cache: dict, key: str, value, now: float, expiry_of, max_size: 
     cache[key] = value
 
 
+async def _ficha_dds_check(keyword: str) -> str:
+    """Palavra-chave do /dds → id da personagem (rpc dds_enter, com a chave anon). Levanta FichaAuthError.
+    A palavra só vai no corpo do pedido ao Supabase; nunca em log nem em mensagem de erro."""
+    try:
+        async with _ficha_http_session().post(
+            f"{FICHA_SUPABASE_URL}/rest/v1/rpc/dds_enter",
+            headers={"apikey": FICHA_SUPABASE_KEY, "Authorization": f"Bearer {FICHA_SUPABASE_KEY}",
+                     "Content-Type": "application/json", "Content-Profile": "ficha_paranormal"},
+            json={"p_key": keyword},
+        ) as r:
+            if r.status != 200:  # com a chave anon, 401/403 aqui é configuração do bot, não a palavra errada
+                logging.warning("ficha-roll: dds_enter answered HTTP %s", r.status)
+                raise FichaAuthError(503, "auth_unavailable")
+            character = await r.json(content_type=None)
+    except FichaAuthError:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        raise FichaAuthError(503, "auth_unavailable")
+    if character is None:
+        raise FichaAuthError(401, "unauthorized")
+    if not isinstance(character, str) or not _DDS_CHARACTER_RE.match(character):
+        logging.warning("ficha-roll: dds_enter returned an unexpected value (%s)", type(character).__name__)
+        raise FichaAuthError(503, "auth_unavailable")
+    return character
+
+
+async def _ficha_dds_auth(keyword: str, client_key: str) -> str:
+    """Palavra-chave → identidade "dds:<personagem>", com as mesmas caches e limites dos tokens."""
+    key = "dds:" + hashlib.sha256(keyword.encode()).hexdigest()  # prefixo: nunca colide com o hash de um token
+    return "dds:" + await _ficha_auth_cached(key, lambda: _ficha_dds_check(keyword), client_key)
+
+
 async def _ficha_auth(token: str, client_key: str) -> str:
     """Token → user id. Cache positiva (5 min) e negativa (401, 60 s); verificações novas no Supabase limitadas
     por IP E por um teto global (o IP pode ser falsificado, o teto não)."""
-    key = hashlib.sha256(token.encode()).hexdigest()
+    return await _ficha_auth_cached(hashlib.sha256(token.encode()).hexdigest(), lambda: _ficha_check_token(token),
+                                    client_key, max_expires=_jwt_exp(token))
+
+
+async def _ficha_auth_cached(key: str, check, client_key: str, max_expires: float | None = None) -> str:
+    """Cache + limites à volta de `check()` (corrotina que devolve a identidade ou levanta FichaAuthError).
+    `key` já é um hash; `max_expires` corta a cache positiva (o `exp` do JWT)."""
     now = time.time()
     neg = _ficha_auth_neg_cache.get(key)
     if neg is not None:
@@ -2034,15 +2096,14 @@ async def _ficha_auth(token: str, client_key: str) -> str:
     if wait:
         raise FichaAuthError(429, "rate_limited", retry_after=wait)
     try:
-        uid = await _ficha_check_token(token)
+        uid = await check()
     except FichaAuthError as e:
         if e.status == 401:
             _bounded_put(_ficha_auth_neg_cache, key, now + FICHA_ROLL_AUTH_NEG_TTL, now, lambda v: v)
         raise
     expires = now + FICHA_ROLL_AUTH_TTL
-    exp = _jwt_exp(token)
-    if exp is not None:
-        expires = min(expires, exp)
+    if max_expires is not None:
+        expires = min(expires, max_expires)
     if expires > now:
         _bounded_put(_ficha_auth_cache, key, (uid, expires), now, lambda v: v[1])
     return uid
@@ -2090,8 +2151,10 @@ def _rate_limited(wait: float) -> web.Response:
 
 
 async def _handle_ficha_roll(request: web.Request) -> web.StreamResponse:
-    token = bearer_token(request.headers.get("Authorization"))
-    if token is None:
+    auth = request.headers.get("Authorization")
+    dds_key = dds_keyword(auth)  # ficha do /dds: palavra-chave em vez de conta
+    token = None if dds_key is not None else bearer_token(auth)
+    if token is None and dds_key is None:
         return _json_err(401, "unauthorized")
     raw = await _read_limited(request, FICHA_ROLL_MAX_BODY)
     if raw is None:
@@ -2105,7 +2168,10 @@ async def _handle_ficha_roll(request: web.Request) -> web.StreamResponse:
     except FichaRollError as e:
         return _json_err(400, "invalid_payload", detail=str(e))
     try:
-        uid = await _ficha_auth(token, _client_key(request))
+        if dds_key is not None:
+            uid = await _ficha_dds_auth(dds_key, _client_key(request))  # "dds:<personagem>"
+        else:
+            uid = await _ficha_auth(token, _client_key(request))
     except FichaAuthError as e:
         if e.status == 429:
             return _rate_limited(e.retry_after)
@@ -2115,6 +2181,15 @@ async def _handle_ficha_roll(request: web.Request) -> web.StreamResponse:
         return _rate_limited(wait)
 
     await ready_event.wait()
+    if dds_key is not None:
+        # /dds: sempre o canal da campanha; `sheet` não escolhe nada
+        resp = await _ficha_send_cached("dds", DDS_ROLL_CHANNEL_ID, payload)
+        if isinstance(resp, web.Response):
+            return resp
+        msg, channel = resp
+        logging.info("ficha-roll: dds character=%s kind=%s channel=%s → msg %s",
+                     uid[4:], payload["kind"], channel.id, msg.id)
+        return web.json_response({"ok": True, "message_id": str(msg.id), "channel_id": str(channel.id)})
     binding = ficha_link_binding(uid, payload["sheet"]) if payload.get("sheet") else None
     if binding is not None:
         # ficha ligada (/ficha_ligar): verificado a cada rolagem que quem ligou e o bot ainda podem escrever lá
@@ -2292,22 +2367,28 @@ async def _handle_ficha_link(request: web.Request) -> web.StreamResponse:
 
 async def _ficha_send_default(payload: dict):
     """Envia no canal padrão. Devolve (msg, canal) ou uma web.Response de erro."""
-    global _ficha_roll_channel
-    default_id, _ = ficha_target_channel_id()
-    if _ficha_roll_channel is not None and getattr(_ficha_roll_channel, "id", None) != default_id:
-        _ficha_roll_channel = None  # o padrão mudou (/ficha_canal_padrao)
-    channel = _ficha_roll_channel or await _resolve_channel(default_id)
+    return await _ficha_send_cached("default", ficha_target_channel_id()[0], payload)
+
+
+async def _ficha_send_cached(slot: str, channel_id: int, payload: dict):
+    """Envia num canal fixo guardado em cache em _ficha_roll_channels[slot] ("default" ou "dds").
+    Devolve (msg, canal) ou uma web.Response de erro."""
+    cached = _ficha_roll_channels.get(slot)
+    if cached is not None and getattr(cached, "id", None) != channel_id:
+        cached = None  # o canal mudou (/ficha_canal_padrao)
+    channel = cached or await _resolve_channel(channel_id)
     if channel is None:
+        _ficha_roll_channels.pop(slot, None)
         return _json_err(503, "channel_unavailable")
-    _ficha_roll_channel = channel
+    _ficha_roll_channels[slot] = channel
     guild = getattr(channel, "guild", None)
     if guild is not None and not feature_enabled(guild.id, "ficha_roll"):
         return _json_err(503, "disabled")
     try:
         msg = await channel.send(embed=ficha_roll_embed(payload), allowed_mentions=discord.AllowedMentions.none())
     except (discord.NotFound, discord.Forbidden) as e:
-        _ficha_roll_channel = None  # canal apagado / sem permissão: volta a resolver no próximo pedido
-        logging.warning("ficha-roll: channel %s refused send (%s) — cache cleared", default_id, e.status)
+        _ficha_roll_channels.pop(slot, None)  # canal apagado / sem permissão: volta a resolver no próximo pedido
+        logging.warning("ficha-roll: channel %s refused send (%s) — cache cleared", channel_id, e.status)
         return _json_err(502, "discord_error")
     except discord.HTTPException as e:
         logging.warning("ficha-roll: Discord send failed (%s)", e.status)

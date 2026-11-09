@@ -613,7 +613,7 @@ async def _run_handler_tests():
 
     B._resolve_channel = fake_resolve
     B._ficha_resolve_quiet = fake_resolve
-    B._ficha_roll_channel = None
+    B._ficha_roll_channels.clear()
     B.ready_event.set()
 
     def reset():
@@ -750,7 +750,7 @@ async def _run_handler_tests():
         fake.send = send_forbidden
         r = await client.post(B.FICHA_ROLL_PATH, json=BASE, headers=H())
         assert r.status == 502 and (await r.json())["error"] == "discord_error"
-        assert B._ficha_roll_channel is None
+        assert "default" not in B._ficha_roll_channels
         del fake.send  # back to the class method
         before = resolves["n"]
         r = await client.post(B.FICHA_ROLL_PATH, json=BASE, headers=H())
@@ -906,11 +906,288 @@ async def _run_handler_tests():
         B._config.pop("ficha_roll", None)
         if saved_cfg is not None:
             B._config["ficha_roll"] = saved_cfg
-        B._ficha_roll_channel = None
+        B._ficha_roll_channels.clear()
 
 
 def test_handler_end_to_end_with_fakes():
     asyncio.run(_run_handler_tests())
+
+
+# ---- /dds: Authorization: DDS <palavra-chave> -----------------------------------------------------------------
+DDS_KEY = "chave-de-teste-nao-real"  # inventada: as palavras verdadeiras nunca entram no repositório
+
+
+def test_dds_keyword_parsing():
+    assert B.dds_keyword(f"DDS {DDS_KEY}") == DDS_KEY
+    assert B.dds_keyword(f"DDS   {DDS_KEY}  ") == DDS_KEY
+    assert B.dds_keyword("DDS duas palavras") == "duas palavras"
+    assert B.dds_keyword("DDS " + "k" * B.DDS_KEY_MAX) == "k" * B.DDS_KEY_MAX
+    for bad in (None, "", "DDS ", "DDS    ", "DDS " + "k" * (B.DDS_KEY_MAX + 1), "DDS a\x7fb", "DDS a\x00b",
+                "dds abc", "DDSabc", "Bearer abc", f"Bearer {DDS_KEY}"):
+        assert B.dds_keyword(bad) is None, bad
+    # como o aiohttp entrega um header vindo do browser: UTF-8 válido, ou um byte latin-1 ("ã" = 0xE3)
+    assert B.dds_keyword("DDS " + "solidão".encode("utf-8").decode("utf-8", "surrogateescape")) == "solidão"
+    assert B.dds_keyword("DDS " + "solidão".encode("latin-1").decode("utf-8", "surrogateescape")) == "solidão"
+    # os dois esquemas não se confundem
+    assert B.bearer_token(f"DDS {DDS_KEY}") is None and B.bearer_token("DDS a.b.c") is None
+
+
+class _FakeHttpResp:
+    def __init__(self, status=200, body=None, bad_json=False):
+        self.status, self.body, self.bad_json = status, body, bad_json
+
+    async def json(self, content_type=None):
+        if self.bad_json:
+            raise ValueError("not json")
+        return self.body
+
+
+class _FakeHttpCtx:
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    async def __aenter__(self):
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeHttpSession:
+    """Faz de aiohttp.ClientSession para o rpc dds_enter: responde conforme a palavra-chave."""
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def post(self, url, headers=None, json=None):
+        self.calls.append({"url": url, "headers": headers, "json": json})
+        return _FakeHttpCtx(self.answers((json or {}).get("p_key")))
+
+
+def test_dds_check_calls_the_rpc():
+    async def run():
+        orig = B._ficha_http_session
+        sess = _FakeHttpSession(lambda key: {
+            DDS_KEY: _FakeHttpResp(200, "gabi"),
+            "errada": _FakeHttpResp(200, None),
+            "http500": _FakeHttpResp(500, {"message": "boom"}),
+            "http401": _FakeHttpResp(401, {"message": "bad apikey"}),
+            "estranha": _FakeHttpResp(200, "GABI; drop"),
+            "numero": _FakeHttpResp(200, 7),
+            "naojson": _FakeHttpResp(200, bad_json=True),
+            "rede": B.aiohttp.ClientConnectionError("down"),
+            "tempo": asyncio.TimeoutError(),
+        }[key])
+        B._ficha_http_session = lambda: sess
+        try:
+            assert await B._ficha_dds_check(DDS_KEY) == "gabi"
+            call = sess.calls[-1]
+            assert call["url"] == f"{B.FICHA_SUPABASE_URL}/rest/v1/rpc/dds_enter"
+            assert call["json"] == {"p_key": DDS_KEY}
+            assert call["headers"]["apikey"] == B.FICHA_SUPABASE_KEY
+            assert call["headers"]["Authorization"] == f"Bearer {B.FICHA_SUPABASE_KEY}"
+            assert call["headers"]["Content-Profile"] == "ficha_paranormal"
+            expected = {"errada": (401, "unauthorized")}
+            for key in ("errada", "http500", "http401", "estranha", "numero", "naojson", "rede", "tempo"):
+                try:
+                    await B._ficha_dds_check(key)
+                except B.FichaAuthError as e:
+                    assert (e.status, e.code) == expected.get(key, (503, "auth_unavailable")), (key, e.status, e.code)
+                else:
+                    raise AssertionError(f"{key} should fail")
+        finally:
+            B._ficha_http_session = orig
+    asyncio.run(run())
+
+
+class _LogCapture(B.logging.Handler):
+    def __init__(self):
+        super().__init__(level=B.logging.DEBUG)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage() + " " + repr(record.args) + " " + str(record.exc_info))
+
+
+async def _run_dds_handler_tests():
+    calls = {"n": 0}
+
+    async def fake_dds_check(keyword):
+        calls["n"] += 1
+        if keyword in (DDS_KEY, "outra-chave-da-gabi"):
+            return "gabi"
+        if keyword == "chave-do-leo":
+            return "leo"
+        if keyword == "supabase-em-baixo":
+            raise B.FichaAuthError(503, "auth_unavailable")
+        raise B.FichaAuthError(401, "unauthorized")
+
+    async def fake_check(token):
+        return "user-" + token[-4:]
+
+    default_ch, dds_ch = _FakeChannel(), _FakeChannel()
+    dds_ch.id, dds_ch.guild = 2222, types.SimpleNamespace(id=31)
+    channels = {default_ch.id: default_ch, 2222: dds_ch}
+    resolves = []
+
+    async def fake_resolve(cid):
+        resolves.append(cid)
+        return channels.get(cid)
+
+    orig = (B._ficha_dds_check, B._ficha_check_token, B._resolve_channel, B.DDS_ROLL_CHANNEL_ID, B._save_config)
+    B._ficha_dds_check, B._ficha_check_token, B._resolve_channel = fake_dds_check, fake_check, fake_resolve
+    B.DDS_ROLL_CHANNEL_ID = 2222
+    B._save_config = lambda: None
+    B._ficha_roll_channels.clear()
+    saved_cfg = B._config.pop("ficha_roll", None)
+    B.ready_event.set()
+
+    def reset():
+        B._ficha_auth_cache.clear()
+        B._ficha_auth_neg_cache.clear()
+        for lim in (B._ficha_roll_limiter, B._ficha_auth_limiter, B._ficha_auth_global_limiter):
+            lim._hits.clear()
+    reset()
+
+    logs = _LogCapture()
+    root = B.logging.getLogger()
+    old_level = root.level
+    root.addHandler(logs)
+    root.setLevel(B.logging.DEBUG)
+    app = web.Application(middlewares=[B._cors_middleware])
+    app.add_routes([web.post(B.FICHA_ROLL_PATH, B._handle_ficha_roll),
+                    web.route("OPTIONS", "/{tail:.*}", B._handle_options)])
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        D = lambda key=DDS_KEY, **h: {"Authorization": f"DDS {key}", "Origin": "https://ordemcodex.xyz", **h}
+
+        # preflight do browser com o header Authorization (o /dds manda DDS <palavra>)
+        r = await client.options(B.FICHA_ROLL_PATH, headers={"Origin": "https://ordemcodex.xyz",
+                                                             "Access-Control-Request-Method": "POST",
+                                                             "Access-Control-Request-Headers": "authorization,content-type"})
+        assert r.status == 204 and r.headers["Access-Control-Allow-Origin"] == "https://ordemcodex.xyz"
+        assert "Authorization" in r.headers["Access-Control-Allow-Headers"]
+
+        # palavra mal formada → 401 sem perguntar ao Supabase
+        for bad in ("", "   ", "k" * (B.DDS_KEY_MAX + 1)):
+            r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D(bad))
+            assert r.status == 401 and (await r.json())["error"] == "unauthorized", bad
+        assert calls["n"] == 0
+        # payload inválido → 400 antes de verificar a palavra
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "dice": [die(value=99)]}, headers=D())
+        assert r.status == 400 and calls["n"] == 0
+
+        # palavra certa → canal do /dds (não o padrão), mesma resposta das outras rolagens; `sheet` é ignorado
+        B._ficha_channels()["sheets"]["dds:gabi"] = {SHEET: {"channel": "777", "guild": "1", "by": "555", "at": 1}}
+        r = await client.post(B.FICHA_ROLL_PATH, json={**OP2, "sheet": SHEET}, headers=D())
+        body = await r.json()
+        assert r.status == 200 and body == {"ok": True, "message_id": "42", "channel_id": "2222"}, body
+        assert r.headers["Access-Control-Allow-Origin"] == "https://ordemcodex.xyz"
+        assert len(dds_ch.sent) == 1 and not default_ch.sent and resolves == [2222]
+        sent = dds_ch.sent[-1]
+        assert sent["embed"].title == "🎲 Rowan - Pontaria"
+        assert not sent["allowed_mentions"].everyone and not sent["allowed_mentions"].users
+        # qualquer kind válido também passa (op2 é o esperado)
+        r = await client.post(B.FICHA_ROLL_PATH, json=BASE, headers=D())
+        assert r.status == 200 and (await r.json())["channel_id"] == "2222"
+        assert calls["n"] == 1, "palavra confirmada fica em cache (5 min)"
+        assert resolves == [2222], "canal do /dds resolvido uma vez e guardado"
+        key = "dds:" + B.hashlib.sha256(DDS_KEY.encode()).hexdigest()
+        assert B._ficha_auth_cache[key][0] == "gabi"
+        assert DDS_KEY not in repr(B._ficha_auth_cache), "cache só guarda o hash"
+
+        # limite por personagem: 8 / 10 s, partilhado por duas palavras da mesma personagem
+        reset()
+        n = len(dds_ch.sent)
+        for i in range(B.FICHA_ROLL_RATE[0]):
+            r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D(DDS_KEY if i % 2 else "outra-chave-da-gabi"))
+            assert r.status == 200, i
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D())
+        assert r.status == 429 and int(r.headers["Retry-After"]) >= 1
+        assert (await r.json())["error"] == "rate_limited"
+        assert len(dds_ch.sent) == n + B.FICHA_ROLL_RATE[0]
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D("chave-do-leo"))
+        assert r.status == 200, "outra personagem tem o seu limite"
+
+        # palavra errada → 401 e cache negativa (60 s): o Supabase só é chamado uma vez
+        reset()
+        n0 = calls["n"]
+        for _ in range(4):
+            r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D("palavra-errada"))
+            assert r.status == 401 and (await r.json())["error"] == "unauthorized"
+        assert calls["n"] == n0 + 1
+        assert ("dds:" + B.hashlib.sha256(b"palavra-errada").hexdigest()) in B._ficha_auth_neg_cache
+
+        # Supabase em baixo → 503 auth_unavailable, sem cache negativa
+        reset()
+        for _ in range(2):
+            r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D("supabase-em-baixo"))
+            assert r.status == 503 and (await r.json())["error"] == "auth_unavailable"
+        assert not B._ficha_auth_neg_cache
+
+        # verificações novas: mesmos limites por IP (30/min) que os tokens
+        reset()
+        for i in range(B.FICHA_ROLL_AUTH_RATE[0]):
+            r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D(f"errada-{i}", **{"X-Real-IP": "1.2.3.4"}))
+            assert r.status == 401
+        n0 = calls["n"]
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D("errada-x", **{"X-Real-IP": "1.2.3.4"}))
+        assert r.status == 429 and "Retry-After" in r.headers and calls["n"] == n0
+        # e o mesmo balde que os tokens Bearer (o limite é do IP, não do esquema)
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2,
+                              headers={"Authorization": "Bearer a.b.tokn", "X-Real-IP": "1.2.3.4"})
+        assert r.status == 429
+
+        # canal do /dds: desligado, inacessível, recusa
+        reset()
+        B.set_feature(31, "ficha_roll", False)
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D())
+        assert r.status == 503 and (await r.json())["error"] == "disabled"
+        B.set_feature(31, "ficha_roll", True)
+
+        async def send_forbidden(**kw):
+            raise discord.Forbidden(types.SimpleNamespace(status=403, reason="Forbidden"), "Missing Permissions")
+        dds_ch.send = send_forbidden
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D())
+        assert r.status == 502 and (await r.json())["error"] == "discord_error"
+        assert "dds" not in B._ficha_roll_channels
+        del dds_ch.send
+        del channels[2222]
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D())
+        assert r.status == 503 and (await r.json())["error"] == "channel_unavailable"
+        channels[2222] = dds_ch
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers=D())
+        assert r.status == 200 and (await r.json())["channel_id"] == "2222"
+
+        # Bearer continua igual: padrão, e o canal do /dds não é tocado
+        reset()
+        n_dds = len(dds_ch.sent)
+        r = await client.post(B.FICHA_ROLL_PATH, json=OP2, headers={"Authorization": "Bearer a.b.good"})
+        assert r.status == 200 and (await r.json())["channel_id"] == str(default_ch.id)
+        assert len(default_ch.sent) == 1 and len(dds_ch.sent) == n_dds
+
+        # a palavra-chave nunca aparece nos logs; a personagem sim
+        everything = "\n".join(logs.lines)
+        for secret in (DDS_KEY, "outra-chave-da-gabi", "chave-do-leo", "palavra-errada", "supabase-em-baixo"):
+            assert secret not in everything, secret
+        assert "dds character=gabi" in everything and "dds character=leo" in everything
+    finally:
+        await client.close()
+        root.removeHandler(logs)
+        root.setLevel(old_level)
+        (B._ficha_dds_check, B._ficha_check_token, B._resolve_channel, B.DDS_ROLL_CHANNEL_ID, B._save_config) = orig
+        B._config.pop("ficha_roll", None)
+        if saved_cfg is not None:
+            B._config["ficha_roll"] = saved_cfg
+        B._ficha_roll_channels.clear()
+        B.set_feature(31, "ficha_roll", True)
+
+
+def test_dds_handler_end_to_end_with_fakes():
+    asyncio.run(_run_dds_handler_tests())
 
 
 if __name__ == "__main__":

@@ -216,6 +216,16 @@ Desligar só as rolagens: `/config disable ficha_roll` no servidor do canal (res
 `ficha` (convites) é independente. Se o envio falhar com *Forbidden*/*Not Found*, o bot esquece o canal em cache e
 volta a resolvê-lo no pedido seguinte (repor a permissão/canal não precisa de restart).
 
+#### Fichas do `/dds` (palavra-chave, sem conta)
+
+As fichas de [ordemcodex.xyz/dds](https://ordemcodex.xyz/dds) não têm conta no site: mandam
+`Authorization: DDS <palavra-chave>` (até 64 caracteres imprimíveis) na mesma rota e com o mesmo corpo. O bot
+confirma a palavra com `POST /rest/v1/rpc/dds_enter` (`{"p_key": …}`, chave anon, `Content-Profile: ficha_paranormal`),
+que devolve o id da personagem ou `null` (→ `401`). Cache de **5 min** (só o hash SHA-256 da palavra), cache negativa
+de **60 s**, os mesmos limites de verificações novas por IP e global, e **8 rolagens / 10 s por personagem**.
+Publica sempre em `DDS_ROLL_CHANNEL_ID` (padrão: o #rolagens da AKRASIA); `sheet` e `/ficha_ligar` não contam aqui.
+Mesmas respostas e erros da tabela acima. A palavra nunca aparece nos logs (só `dds character=<id>`).
+
 #### Ligar a ficha a um canal (`/ficha_ligar`)
 
 Cada ficha rola no canal da sua mesa. Na ficha, **Ligar a um canal** pede um código ao bot; no canal da mesa, quem
@@ -323,6 +333,7 @@ Se `DATA_DIR` não for gravável (dev local, ou volume mal montado), o bot avisa
 | `FICHA_INVITE_SECRET` | — | Segredo do `/ficha_convite` (ver acima) |
 | `FICHA_GUILD_IDS` | — | Servidores onde o `/ficha_convite` funciona (vazio = todos) |
 | `FICHA_ROLL_CHANNEL_ID` | — | Canal das rolagens da ficha (default `1165819468354687066`) |
+| `DDS_ROLL_CHANNEL_ID` | — | Canal das rolagens das fichas do `/dds` (default `1165819468354687066`) |
 | `FICHA_ROLL_ORIGINS` | — | Origens CORS do `/webhook/ficha-roll` (default: site, www, preview, `localhost:5184`) |
 | `FICHA_SUPABASE_URL` / `FICHA_SUPABASE_KEY` | — | Supabase do site (defaults = projeto hub + chave publishable) |
 
