@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Ajudante">
+<title>Ajudante · Som</title>
+<style>
+  :root { --bg:#0d0f14; --panel:#171a22; --line:#262b37; --text:#e8eaf0; --dim:#8a91a3;
+          --music:#3d6df2; --tape:#d8902a; --sfx:#2aa37a; --stop:#c8413b; --on:#f5d04a; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; background:var(--bg); color:var(--text);
+    font:15px/1.3 -apple-system, system-ui, sans-serif; -webkit-user-select:none; user-select:none; }
+  body { padding:calc(env(safe-area-inset-top) + 8px) 12px calc(env(safe-area-inset-bottom) + 16px); }
+  header { position:sticky; top:0; z-index:2; background:var(--bg); padding-bottom:8px; }
+  .status { display:flex; gap:8px; align-items:center; font-size:13px; color:var(--dim); }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--stop); flex:none; }
+  .dot.ok { background:var(--sfx); }
+  .now { margin-top:6px; padding:8px 10px; background:var(--panel); border:1px solid var(--line);
+         border-radius:10px; min-height:40px; font-size:14px; }
+  .now b { color:var(--on); font-weight:600; }
+  .meter { height:4px; background:var(--line); border-radius:2px; margin-top:6px; overflow:hidden; }
+  .meter i { display:block; height:100%; width:0; background:var(--sfx); transition:width .15s; }
+  h2 { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); margin:16px 2px 6px; }
+  .grid { display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; }
+  .grid.three { grid-template-columns:repeat(3, 1fr); }
+  button { appearance:none; border:0; border-radius:12px; color:#fff; font:inherit; font-weight:600;
+    min-height:64px; padding:8px; text-align:left; display:flex; flex-direction:column; justify-content:space-between;
+    background:var(--panel); border:1px solid var(--line); }
+  button small { font-weight:400; color:rgba(255,255,255,.7); font-size:12px; }
+  button.music { background:linear-gradient(160deg, var(--music), #2747a8); border:0; }
+  button.tape { background:linear-gradient(160deg, var(--tape), #8f5a14); border:0; }
+  button.sfx { background:linear-gradient(160deg, var(--sfx), #176b50); border:0; min-height:54px; }
+  button.ctl { background:#232836; min-height:54px; align-items:center; justify-content:center; text-align:center; }
+  button.danger { background:var(--stop); border:0; }
+  button.playing { outline:3px solid var(--on); outline-offset:-3px; }
+  button:active { transform:scale(.97); filter:brightness(1.2); }
+  .vol { display:grid; grid-template-columns:1fr 54px 64px 54px; gap:6px; align-items:center; margin-bottom:6px; }
+  .vol span.v { text-align:center; font-variant-numeric:tabular-nums; }
+  .vol button { min-height:44px; align-items:center; justify-content:center; }
+  #login { display:none; margin-top:30px; }
+  #login input { width:100%; font-size:16px; padding:12px; border-radius:10px; border:1px solid var(--line);
+                 background:var(--panel); color:var(--text); }
+  #toast { position:fixed; left:12px; right:12px; bottom:calc(env(safe-area-inset-bottom) + 12px); padding:10px 12px;
+    background:#000c; border-radius:10px; font-size:13px; opacity:0; transition:opacity .2s; pointer-events:none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="status"><span class="dot" id="dot"></span><span id="chan">a ligar…</span></div>
+  <div class="now" id="now">—</div>
+  <div class="meter"><i id="peak"></i></div>
+</header>
+
+<div id="login">
+  <p>Código do Ajudante:</p>
+  <input id="tok" type="password" autocomplete="off">
+  <p><button class="ctl" onclick="saveTok()">Guardar</button></p>
+</div>
+
+<main id="main">
+  <div class="grid three">
+    <button class="ctl danger" onclick="cmd({action:'fade_all',fade:3})">Fade tudo<small>3 s</small></button>
+    <button class="ctl" onclick="cmd({action:'stop',target:'music'})">Parar música<small>4 s</small></button>
+    <button class="ctl danger" onclick="cmd({action:'silence'})">Silêncio<small>já</small></button>
+    <button class="ctl" onclick="cmd({action:'break'})">Break<small>sai do loop</small></button>
+    <button class="ctl" onclick="cmd({action:'next'})">Next<small>secção seguinte</small></button>
+    <button class="ctl" onclick="cmd({action:'stop',target:'tape'})">Parar fita</button>
+    <button class="ctl" onclick="cmd({action:'stop',target:'sfx'})">Parar efeitos</button>
+  </div>
+  <h2>Música</h2><div class="grid" id="g-music"></div>
+  <h2>Fitas</h2><div class="grid" id="g-tape"></div>
+  <h2>Efeitos</h2><div class="grid three" id="g-sfx"></div>
+  <h2>Volume</h2><div id="vols"></div>
+  <h2>Canal</h2>
+  <div class="grid">
+    <button class="ctl" onclick="cmd({action:'join'})">Entrar na voz</button>
+    <button class="ctl" onclick="if(confirm('Sair do canal de voz?'))cmd({action:'leave'})">Sair da voz</button>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+const h = new URLSearchParams(location.hash.slice(1));
+if (h.get('t')) { try { localStorage.setItem('som_t', h.get('t')); } catch (e) {} history.replaceState(null, '', location.pathname); }
+let T = ''; try { T = localStorage.getItem('som_t') || ''; } catch (e) {}
+let cuesKey = '';
+const $ = id => document.getElementById(id);
+function saveTok() { T = $('tok').value.trim(); try { localStorage.setItem('som_t', T); } catch (e) {} $('login').style.display = 'none'; $('main').style.display = ''; poll(); }
+function toast(s) { const t = $('toast'); t.textContent = s; t.style.opacity = 1; clearTimeout(toast.k); toast.k = setTimeout(() => t.style.opacity = 0, 1800); }
+async function cmd(body) {
+  try {
+    const r = await fetch('/som/cmd', { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + T }, body:JSON.stringify(body) });
+    const j = await r.json();
+    if (!j.ok) toast('Erro: ' + (j.detail || j.error)); else if (navigator.vibrate) navigator.vibrate(15);
+    poll();
+  } catch (e) { toast('Sem ligação'); }
+}
+function build(cues) {
+  for (const k of ['music', 'tape', 'sfx']) $('g-' + k).innerHTML = '';
+  for (const c of cues) {
+    const b = document.createElement('button');
+    b.className = c.kind; b.dataset.id = c.id;
+    b.innerHTML = '<span></span><small></small>';
+    b.firstChild.textContent = c.title; b.lastChild.textContent = c.hint || '';
+    b.onclick = () => cmd({ action:'play', cue:c.id });
+    ($('g-' + c.kind) || $('g-sfx')).appendChild(b);
+  }
+}
+function vols(v) {
+  const names = { master:'Geral', music:'Música', tape:'Fitas', sfx:'Efeitos' };
+  $('vols').innerHTML = Object.keys(names).map(k =>
+    `<div class="vol"><span>${names[k]}</span><button class="ctl" onclick="cmd({action:'nudge',bus:'${k}',step:-2})">−</button>` +
+    `<span class="v">${(v[k] >= 0 ? '+' : '') + v[k].toFixed(0)} dB</span><button class="ctl" onclick="cmd({action:'nudge',bus:'${k}',step:2})">+</button></div>`).join('');
+}
+async function poll() {
+  if (!T) { $('login').style.display = 'block'; $('main').style.display = 'none'; return; }
+  try {
+    const r = await fetch('/som/state', { headers:{ 'Authorization':'Bearer ' + T } });
+    if (r.status === 401) { T = ''; $('login').style.display = 'block'; $('main').style.display = 'none'; return; }
+    const s = await r.json();
+    const key = JSON.stringify(s.cues);
+    if (key !== cuesKey) { cuesKey = key; build(s.cues); }
+    vols(s.volume_db);
+    $('dot').className = 'dot' + (s.voice.connected && s.voice.playing ? ' ok' : '');
+    $('chan').textContent = s.voice.connected ? ('Na voz: ' + s.voice.name) : 'Fora do canal de voz' + (s.error ? ' · ' + s.error : '');
+    const parts = [];
+    if (s.music) parts.push(`<b>♪ ${s.music.title}</b> · ${s.music.section || ''}${s.music.looping ? ' ↻' : ''} · ${s.music.t}s`);
+    if (s.tape) parts.push(`<b>▶ ${s.tape.title}</b> · ${s.tape.t}s`);
+    if (s.sfx.length) parts.push('efeitos: ' + s.sfx.length);
+    if (s.loading) parts.push('a preparar ficheiros…');
+    $('now').innerHTML = parts.join('<br>') || 'Silêncio';
+    $('peak').style.width = Math.min(100, s.peak * 100) + '%';
+    document.querySelectorAll('button[data-id]').forEach(b => b.classList.toggle('playing',
+      (s.music && s.music.cue === b.dataset.id) || (s.tape && s.tape.cue === b.dataset.id) || s.sfx.includes(b.dataset.id)));
+  } catch (e) { $('dot').className = 'dot'; $('chan').textContent = 'Sem ligação ao Ajudante'; }
+}
+poll(); setInterval(poll, 1000);
+</script>
+</body>
+</html>

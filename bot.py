@@ -27,6 +27,14 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 ready_event = asyncio.Event()
 
+# ---- som: música, fitas e efeitos no canal de voz (som.py) ------------------
+try:
+    import som as _som
+    SOM = _som.setup(bot)
+except Exception:  # sem numpy/av o resto do bot continua
+    logging.exception("som: desligado")
+    SOM = None
+
 @bot.event
 async def on_ready():
     logging.info("✅ Logged in as %s (id=%s)", bot.user, bot.user.id)
@@ -47,6 +55,11 @@ async def on_ready():
     if not getattr(bot, "_ficha_roll_checked", False):
         bot._ficha_roll_checked = True
         bot.loop.create_task(_ficha_roll_startup_check())
+    if SOM is not None and not getattr(bot, "_som_started", False):
+        bot._som_started = True
+        bot.loop.create_task(SOM.preload())
+        bot.loop.create_task(SOM.watchdog())
+        logging.info("🔊 Som: watchdog do canal de voz ligado")
     if not getattr(bot, "_scheduler_started", False):
         bot.loop.create_task(_session_scheduler_loop())
         bot._scheduler_started = True
@@ -437,7 +450,7 @@ async def _ensure_webhook_server():
         web.post(FICHA_ROLL_PATH, _handle_ficha_roll),
         web.post(FICHA_LINK_PATH, _handle_ficha_link),
         web.route("OPTIONS", "/{tail:.*}", _handle_options),
-    ])
+    ] + (SOM.routes() if SOM is not None else []))
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "8080"))
