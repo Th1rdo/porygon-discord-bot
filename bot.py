@@ -350,8 +350,21 @@ BROADCAST_FILE_MAX = 8 * 1024 * 1024  # bytes, por ficheiro
 BROADCAST_FILES_LIMIT = 4
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+
+def _broadcast_allow_local_http() -> bool:
+    """`http://localhost` / `127.0.0.1` só com BROADCAST_ALLOW_LOCAL_HTTP=1 (dev e testes)."""
+    return os.environ.get("BROADCAST_ALLOW_LOCAL_HTTP", "") == "1"
+
+
+def _broadcast_file_hosts() -> set[str]:
+    """Lista opcional de hosts permitidos (BROADCAST_FILE_HOSTS, separados por vírgulas). Vazia = qualquer."""
+    raw = os.environ.get("BROADCAST_FILE_HOSTS", "")
+    return {h.strip().lower().rstrip(".") for h in raw.split(",") if h.strip()}
+
+
 def broadcast_files_validate(files) -> list[dict]:
-    """Valida o campo opcional `files`: [{"url", "filename"}], máx. 4, https (ou http só para localhost).
+    """Valida o campo opcional `files`: [{"url", "filename"}], máx. 4, https (http para localhost só com
+    BROADCAST_ALLOW_LOCAL_HTTP=1). Se BROADCAST_FILE_HOSTS estiver definida, só esses hosts são aceites.
     Devolve a lista normalizada (filename reduzido ao nome base). Levanta ValueError."""
     if files is None:
         return []
@@ -368,10 +381,15 @@ def broadcast_files_validate(files) -> list[dict]:
         if not name or name in (".", ".."):
             raise ValueError("invalid filename")
         parts = urlsplit(url)
-        if not (parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in _LOCAL_HOSTS)):
+        local_http = (parts.scheme == "http" and parts.hostname in _LOCAL_HOSTS
+                      and _broadcast_allow_local_http())
+        if not (parts.scheme == "https" or local_http):
             raise ValueError("file urls must be https")
         if not parts.hostname:
             raise ValueError("invalid file url")
+        allowed = _broadcast_file_hosts()
+        if allowed and parts.hostname.lower().rstrip(".") not in allowed:
+            raise ValueError("file host not allowed")
         out.append({"url": url, "filename": name})
     return out
 

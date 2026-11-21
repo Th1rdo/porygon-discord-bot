@@ -292,7 +292,7 @@ Servidor aiohttp na porta `PORT` (default 8080) para disparar rolls de fora do D
 |---|---|---|
 | `POST /webhook/roll` | `{"token", "channel_id", "expression", "message"?}` | Rola dados num canal |
 | `POST /webhook/rollmessage` | `{"token", "channel_id", "expression", "message"}` | Roll com cabeçalho |
-| `POST /webhook/broadcast` | `{"token", "channel_ids": [..], "content", "files"?: [{"url", "filename"}]}` | Envia a mesma mensagem a vários canais (máx. 10, conteúdo ≤2000 chars). `files` (opcional, máx. 4): o bot descarrega cada URL (`https`; `http` só para localhost), ≤8 MB cada, sem seguir redirects, e anexa-os à mensagem. Se algum download falhar, nada é enviado e cada canal devolve `error: attachment …` |
+| `POST /webhook/broadcast` | `{"token", "channel_ids": [..], "content", "files"?: [{"url", "filename"}]}` | Envia a mesma mensagem a vários canais (máx. 10, conteúdo ≤2000 chars). `files` (opcional, máx. 4): o bot descarrega cada URL (`https`; `http://localhost` / `127.0.0.1` só com `BROADCAST_ALLOW_LOCAL_HTTP=1`; se `BROADCAST_FILE_HOSTS` estiver definida, só desses hosts), ≤8 MB cada, sem seguir redirects, e anexa-os à mensagem. Se algum download falhar, nada é enviado e cada canal devolve `error: attachment …` |
 | `POST /webhook/ficha-roll` | ver [Rolagens da ficha](#-rolagens-da-ficha--discord) | Rolagem vinda da ficha; auth = token Supabase do jogador (sem `token`) |
 | `POST /webhook/ficha-link` | ver [Ligar a ficha a um canal](#ligar-a-ficha-a-um-canal-ficha_ligar) | Código, estado e desligar da ligação ficha → canal; mesmo auth |
 | `POST /webhook/preset` | `{"token", "preset", "target"?}` | Envia uma mensagem **hardcoded** (`BROADCAST_PRESETS` no `bot.py`) aos canais do target (`BROADCAST_CHANNELS`). `target` é `"test"` (default) ou `"prod"` — usado pelos botões do site. Presets atuais: `reconstrucao` |
@@ -336,6 +336,8 @@ Se `DATA_DIR` não for gravável (dev local, ou volume mal montado), o bot avisa
 | `DDS_ROLL_CHANNEL_ID` | — | Canal das rolagens das fichas do `/dds` (default `1165819468354687066`) |
 | `FICHA_ROLL_ORIGINS` | — | Origens CORS do `/webhook/ficha-roll` (default: site, www, preview, `localhost:5184`) |
 | `FICHA_SUPABASE_URL` / `FICHA_SUPABASE_KEY` | — | Supabase do site (defaults = projeto hub + chave publishable) |
+| `BROADCAST_FILE_HOSTS` | — | Hosts (separados por vírgulas) de onde o `/webhook/broadcast` pode descarregar anexos. Vazio = qualquer host `https` |
+| `BROADCAST_ALLOW_LOCAL_HTTP` | — | `1` aceita anexos em `http://localhost` / `127.0.0.1` (só dev e testes; nunca em produção) |
 
 **Fluxo normal de trabalho:** editar `bot.py` → commit → `git push` → o Railway faz build e redeploy sozinho (1–2 min). Os slash commands sincronizam no arranque (`on_ready`); comandos novos podem demorar uns minutos a aparecer no Discord.
 
@@ -360,6 +362,7 @@ não tocam em nada real). Importar `bot.py` não arranca o bot (`bot.run` está 
 
 ```bash
 .venv/bin/python tests/test_ficha_roll.py      # ou: .venv/bin/python -m pytest tests/ (se tiveres pytest)
+.venv/bin/python tests/test_broadcast_files.py # anexos do /webhook/broadcast (define BROADCAST_ALLOW_LOCAL_HTTP=1 sozinho)
 ```
 
 ### Estrutura do `bot.py`

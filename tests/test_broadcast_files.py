@@ -7,6 +7,8 @@ import tempfile
 
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="porygon-test-")
+os.environ["BROADCAST_ALLOW_LOCAL_HTTP"] = "1"  # o servidor de teste é http://127.0.0.1
+os.environ.pop("BROADCAST_FILE_HOSTS", None)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bot as B  # noqa: E402
@@ -111,6 +113,60 @@ def test_url_policy():
         except ValueError:
             continue
         raise AssertionError(f"accepted {b!r}")
+
+
+class env:
+    """Define/remove variáveis de ambiente durante um bloco e repõe-nas no fim."""
+    def __init__(self, **values):
+        self.values, self.saved = values, {}
+
+    def __enter__(self):
+        for k, v in self.values.items():
+            self.saved[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def rejects(files):
+    try:
+        B.broadcast_files_validate(files)
+    except ValueError:
+        return True
+    return False
+
+
+def test_local_http_needs_opt_in():
+    local = [{"url": "http://127.0.0.1:9/a.png", "filename": "a.png"}]
+    with env(BROADCAST_ALLOW_LOCAL_HTTP=None):
+        assert rejects(local)
+        assert rejects([{"url": "http://localhost:9/a.png", "filename": "a.png"}])
+        assert not rejects([{"url": "https://x.example/a.png", "filename": "a.png"}])
+    with env(BROADCAST_ALLOW_LOCAL_HTTP="0"):
+        assert rejects(local)
+    with env(BROADCAST_ALLOW_LOCAL_HTTP="1"):
+        assert not rejects(local)
+
+
+def test_file_hosts_allowlist():
+    a = [{"url": "https://files.example.test/a.png", "filename": "a.png"}]
+    b = [{"url": "https://other.example.test/a.png", "filename": "a.png"}]
+    with env(BROADCAST_FILE_HOSTS=None):
+        assert not rejects(a) and not rejects(b)
+    with env(BROADCAST_FILE_HOSTS=" Files.Example.Test , cdn.example.test"):
+        assert not rejects(a)
+        assert rejects(b)
+        assert rejects([{"url": "http://127.0.0.1:9/a.png", "filename": "a.png"}])  # local fora da lista
+    with env(BROADCAST_FILE_HOSTS="127.0.0.1"):
+        assert not rejects([{"url": "http://127.0.0.1:9/a.png", "filename": "a.png"}])
 
 
 def test_handler_rejects_bad_files():
