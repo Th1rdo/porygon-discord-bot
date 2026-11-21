@@ -6,8 +6,10 @@ import math
 import random
 import signal
 import logging
+import io
 import asyncio
 import aiohttp
+from urllib.parse import urlsplit
 from aiohttp import web
 import discord
 from discord import app_commands
@@ -344,16 +346,79 @@ Responde com base no que o teu personagem **tentou** fazer — não apenas no qu
 -# ⌛ Aguardando preenchimento do intervalo…""",
 }
 
-async def _broadcast_to(channel_ids: list[str], content: str) -> dict[str, str]:
+BROADCAST_FILE_MAX = 8 * 1024 * 1024  # bytes, por ficheiro
+BROADCAST_FILES_LIMIT = 4
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+def broadcast_files_validate(files) -> list[dict]:
+    """Valida o campo opcional `files`: [{"url", "filename"}], máx. 4, https (ou http só para localhost).
+    Devolve a lista normalizada (filename reduzido ao nome base). Levanta ValueError."""
+    if files is None:
+        return []
+    if not isinstance(files, list) or len(files) > BROADCAST_FILES_LIMIT:
+        raise ValueError(f"files must be a list of at most {BROADCAST_FILES_LIMIT} items")
+    out = []
+    for f in files:
+        if not isinstance(f, dict):
+            raise ValueError("each file must be an object with url and filename")
+        url, name = f.get("url"), f.get("filename")
+        if not isinstance(url, str) or not isinstance(name, str):
+            raise ValueError("each file needs a string url and filename")
+        name = os.path.basename(name.replace("\\", "/")).strip()
+        if not name or name in (".", ".."):
+            raise ValueError("invalid filename")
+        parts = urlsplit(url)
+        if not (parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in _LOCAL_HOSTS)):
+            raise ValueError("file urls must be https")
+        if not parts.hostname:
+            raise ValueError("invalid file url")
+        out.append({"url": url, "filename": name})
+    return out
+
+async def _fetch_broadcast_files(files: list[dict]) -> list[tuple[str, bytes]]:
+    """Descarrega os ficheiros (sem seguir redirects, com limite de tamanho). Levanta ValueError."""
+    fetched = []
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for f in files:
+            try:
+                async with session.get(f["url"], allow_redirects=False) as resp:
+                    if resp.status != 200:
+                        raise ValueError(f"{f['filename']}: HTTP {resp.status}")
+                    declared = resp.content_length
+                    if declared is not None and declared > BROADCAST_FILE_MAX:
+                        raise ValueError(f"{f['filename']}: too large")
+                    buf = bytearray()
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        buf += chunk
+                        if len(buf) > BROADCAST_FILE_MAX:
+                            raise ValueError(f"{f['filename']}: too large")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                raise ValueError(f"{f['filename']}: fetch failed ({type(e).__name__})")
+            fetched.append((f["filename"], bytes(buf)))
+    return fetched
+
+async def _broadcast_to(channel_ids: list[str], content: str, files: list[dict] | None = None) -> dict[str, str]:
     await ready_event.wait()
     results: dict[str, str] = {}
+    blobs: list[tuple[str, bytes]] = []
+    if files:
+        try:
+            blobs = await _fetch_broadcast_files(broadcast_files_validate(files))
+        except ValueError as e:
+            logging.warning("Broadcast attachment fetch failed: %s", e)
+            return {str(cid): f"error: attachment {e}" for cid in channel_ids}
     for cid in channel_ids:
         channel = await _resolve_channel(int(cid))
         if channel is None:
             results[str(cid)] = "error: channel not found"
             continue
         try:
-            await channel.send(content)
+            if blobs:
+                # um discord.File novo por canal: o buffer consome-se ao enviar
+                await channel.send(content, files=[discord.File(io.BytesIO(b), filename=n) for n, b in blobs])
+            else:
+                await channel.send(content)
             results[str(cid)] = "ok"
         except discord.HTTPException as e:
             logging.exception("Broadcast send failed for channel %s", cid)
@@ -388,7 +453,7 @@ async def _handle_preset(request: web.Request) -> web.StreamResponse:
 
 async def _handle_broadcast(request: web.Request) -> web.StreamResponse:
     """Send the same message to several channels. Body:
-    {"token": str, "channel_ids": [int, ...], "content": str}
+    {"token": str, "channel_ids": [int, ...], "content": str, "files"?: [{"url", "filename"}]}
     Used by the website's buttons (e.g. temporal-reconstruction prompts)."""
     try:
         data = await request.json()
@@ -411,7 +476,12 @@ async def _handle_broadcast(request: web.Request) -> web.StreamResponse:
     except (TypeError, ValueError):
         return web.json_response({"error": "channel_ids must be integers"}, status=400)
 
-    results = await _broadcast_to(cids, content)
+    try:
+        files = broadcast_files_validate(data.get("files"))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+    results = await _broadcast_to(cids, content, files)
     ok = all(v == "ok" for v in results.values())
     return web.json_response({"ok": ok, "results": results}, status=200 if ok else 207)
 

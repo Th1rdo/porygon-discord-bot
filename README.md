@@ -292,7 +292,7 @@ Servidor aiohttp na porta `PORT` (default 8080) para disparar rolls de fora do D
 |---|---|---|
 | `POST /webhook/roll` | `{"token", "channel_id", "expression", "message"?}` | Rola dados num canal |
 | `POST /webhook/rollmessage` | `{"token", "channel_id", "expression", "message"}` | Roll com cabeçalho |
-| `POST /webhook/broadcast` | `{"token", "channel_ids": [..], "content"}` | Envia a mesma mensagem a vários canais (máx. 10, conteúdo ≤2000 chars) |
+| `POST /webhook/broadcast` | `{"token", "channel_ids": [..], "content", "files"?: [{"url", "filename"}]}` | Envia a mesma mensagem a vários canais (máx. 10, conteúdo ≤2000 chars). `files` (opcional, máx. 4): o bot descarrega cada URL (`https`; `http` só para localhost), ≤8 MB cada, sem seguir redirects, e anexa-os à mensagem. Se algum download falhar, nada é enviado e cada canal devolve `error: attachment …` |
 | `POST /webhook/ficha-roll` | ver [Rolagens da ficha](#-rolagens-da-ficha--discord) | Rolagem vinda da ficha; auth = token Supabase do jogador (sem `token`) |
 | `POST /webhook/ficha-link` | ver [Ligar a ficha a um canal](#ligar-a-ficha-a-um-canal-ficha_ligar) | Código, estado e desligar da ligação ficha → canal; mesmo auth |
 | `POST /webhook/preset` | `{"token", "preset", "target"?}` | Envia uma mensagem **hardcoded** (`BROADCAST_PRESETS` no `bot.py`) aos canais do target (`BROADCAST_CHANNELS`). `target` é `"test"` (default) ou `"prod"` — usado pelos botões do site. Presets atuais: `reconstrucao` |
