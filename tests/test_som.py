@@ -135,6 +135,19 @@ def test_next_jumps_to_following_section():
     assert m.state()["music"]["section"] == "End"
 
 
+def test_drop_and_reset_only_touch_voices():
+    cues = {"m": {"kind": "music", "file": "m"}, "x": {"kind": "sfx", "file": "x", "loop": True}}
+    m = mixer(cues, {"m": tone(10), "x": tone(1, 1000)})
+    m.set_volume("music", -6, 0)
+    m.play("m", fade=0); m.play("x")
+    assert m.active_cues() == {"m", "x"}
+    m.drop("x")
+    assert m.active_cues() == {"m"} and m.state()["music"]["cue"] == "m"
+    m.reset()
+    assert m.active_cues() == set() and m.bus_db["music"] == -6
+    assert rms(run(m, 0.5), 0, 0.5) == 0
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):

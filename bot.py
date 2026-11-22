@@ -61,11 +61,22 @@ async def on_ready():
         bot._som_started = True
         bot.loop.create_task(SOM.preload())
         bot.loop.create_task(SOM.watchdog())
-        logging.info("🔊 Som: watchdog do canal de voz ligado")
+        bot.loop.create_task(SOM.visita.loop())
+        logging.info("🔊 Som: watchdog do canal de voz e visitas agendadas ligados")
     if not getattr(bot, "_scheduler_started", False):
         bot.loop.create_task(_session_scheduler_loop())
         bot._scheduler_started = True
         logging.info("🗓️ Session scheduler loop started")
+
+@bot.listen("on_voice_state_update")
+async def _som_voice_state(member, before, after):
+    # visitas agendadas (visita.py): avisa quem entra no canal durante uma visita. Precisa do intent
+    # voice_states, que vem em discord.Intents.default().
+    if SOM is not None:
+        try:
+            await SOM.visita.on_voice_state(member, before, after)
+        except Exception:
+            logging.exception("som: visita/on_voice_state")
 
 # ---- per-guild config ------------------------------------------------------
 import json

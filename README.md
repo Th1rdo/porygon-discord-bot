@@ -20,6 +20,7 @@ Bot de Discord para as campanhas de TTRPG — dados, missões, countdowns e agen
    - [🕵️ Ficha Paranormal (convite para o site)](#️-ficha-paranormal-convite-para-o-site)
    - [🎲 Rolagens da ficha → Discord](#-rolagens-da-ficha--discord)
    - [⚙️ Config por servidor](#️-config-por-servidor)
+   - [🔊 Som (canal de voz) e visitas agendadas](#-som-canal-de-voz-e-visitas-agendadas)
    - [🌐 Webhook HTTP](#-webhook-http)
 2. [Persistência de dados](#persistência-de-dados)
 3. [Hosting e deploy (Railway)](#hosting-e-deploy-railway)
@@ -284,6 +285,57 @@ Só para admins/gestores. O bot envia a mensagem como se fosse ele a falar.
 
 O texto vive em `AJUDA_TEXT` no `bot.py` — ao adicionar um comando novo, acrescenta-o lá (e aqui). O `!help` embutido do discord.py está **desativado** para não entrar em conflito com outros bots (ex.: Avrae).
 
+### 🔊 Som (canal de voz) e visitas agendadas
+
+O Ajudante toca música, fitas e efeitos num canal de voz, comandado do telemóvel (`som.py`, página em `GET /som`).
+Os ficheiros, `cues.json` (as deixas) e `config.json` (canal, volumes, visitas) vivem em `DATA_DIR/som/`, nunca no repo.
+Todas as rotas menos a página pedem `Authorization: Bearer <SOM_TOKEN>` (ou `WEBHOOK_TOKEN`).
+
+| Rota | Descrição |
+|---|---|
+| `GET /som/state` | O que está a tocar, volumes, canal, deixas |
+| `POST /som/cmd` | `{"action": play\|stop\|break\|next\|fade_all\|silence\|volume\|nudge\|join\|leave, ...}` |
+| `PUT /som/files/{nome}` | Carregar um ficheiro de som (corpo cru) |
+| `PUT /som/cues` | Substituir a lista de deixas |
+| `GET /som/visita` | Configuração e estado da visita agendada (dia de hoje decidido?, visita em curso?, hora de saída) |
+| `PUT /som/visita` | Validar e substituir a configuração da visita (erros → 400 com a lista) |
+| `POST /som/visita/agora` | `{"minutes": n}` (1–30): visita de teste já, por n minutos. Não gasta a visita do dia. 409 se o som estiver em uso |
+
+#### Visitas agendadas (`visita.py`)
+
+Uma vez por dia, a uma hora marcada, o Ajudante entra sozinho num canal de voz, toca uma deixa (em loop) e sai a uma
+hora sorteada dentro de uma janela. Não escreve nada nem muda o estado do bot. Configuração em `config.json` → `"visita"`:
+
+```json
+{"enabled": true, "channel_id": "123456789012345678", "cue": "ambiente",
+ "start": "22:30", "leave_between": ["22:45", "23:00"], "tz": "Europe/Lisbon", "days": ["fri", "sat"]}
+```
+
+| Campo | Default | |
+|---|---|---|
+| `enabled` | `false` | Liga o agendamento (a visita de teste funciona mesmo desligado) |
+| `channel_id` | — | Canal de voz (obrigatório para ligar) |
+| `cue` | — | Id de uma deixa em `cues.json` (obrigatório para ligar). Convém `"loop": true` |
+| `start` | `"22:30"` | Hora de entrada, no fuso `tz` (com hora de verão) |
+| `leave_between` | `["22:45","23:00"]` | Janela da saída; tem de ser `start < início <= fim`, no mesmo dia |
+| `tz` | `"Europe/Lisbon"` | Fuso IANA |
+| `days` | todos | Lista de dias: `0`–`6` (segunda = 0) ou `mon`…`sun` |
+
+Comportamento (um tick a cada ~20 s):
+
+- **Som em uso → o dia é saltado.** Se à hora de entrada a Station já estiver num canal (uma sessão), não há visita
+  nesse dia (`last_outcome: "busy"` e uma linha no log). Se o bot só ficar pronto depois do início da janela de saída,
+  o dia fica `"missed"`. Um dia nunca tem duas visitas.
+- **Alguém pega no som → a visita acaba em silêncio.** Entrar noutro canal, tocar outra deixa, `leave` ou parar a deixa
+  da visita: a visita deixa de mandar. Não sai do canal, não mexe em volumes nem no que foi posto a tocar; só a deixa
+  da visita é retirada (fade de 3 s), para não ficar a tocar por baixo.
+- **Reinícios.** O estado vive em `config.json` → `"visita_state"`. Se o bot reiniciar a meio, o watchdog volta ao
+  canal e a visita retoma a deixa até à hora de saída; se já passou da hora, sai logo.
+- **Quem entra.** Se `VISITA_NOTIFY_WEBHOOK` (URL de um webhook do Discord) estiver definida, cada pessoa (não bots)
+  que entrar no canal durante uma visita gera um aviso, uma vez por pessoa e visita:
+  `👂 <nome> entrou em <canal> durante a visita (hh:mm)`, com menções desligadas e markdown escapado.
+  Usa o intent `voice_states` (vem em `Intents.default()`).
+
 ### 🌐 Webhook HTTP
 
 Servidor aiohttp na porta `PORT` (default 8080) para disparar rolls de fora do Discord.
@@ -337,6 +389,8 @@ Se `DATA_DIR` não for gravável (dev local, ou volume mal montado), o bot avisa
 | `FICHA_ROLL_ORIGINS` | — | Origens CORS do `/webhook/ficha-roll` (default: site, www, preview, `localhost:5184`) |
 | `FICHA_SUPABASE_URL` / `FICHA_SUPABASE_KEY` | — | Supabase do site (defaults = projeto hub + chave publishable) |
 | `BROADCAST_FILE_HOSTS` | — | Hosts (separados por vírgulas) de onde o `/webhook/broadcast` pode descarregar anexos. Vazio = qualquer host `https` |
+| `SOM_TOKEN` | — | Protege as rotas `/som/*` (sem ela usa `WEBHOOK_TOKEN`) |
+| `VISITA_NOTIFY_WEBHOOK` | — | Webhook do Discord para os avisos de quem entra durante uma visita (vazio = sem avisos) |
 | `BROADCAST_ALLOW_LOCAL_HTTP` | — | `1` aceita anexos em `http://localhost` / `127.0.0.1` (só dev e testes; nunca em produção) |
 
 **Fluxo normal de trabalho:** editar `bot.py` → commit → `git push` → o Railway faz build e redeploy sozinho (1–2 min). Os slash commands sincronizam no arranque (`on_ready`); comandos novos podem demorar uns minutos a aparecer no Discord.
@@ -363,6 +417,8 @@ não tocam em nada real). Importar `bot.py` não arranca o bot (`bot.run` está 
 ```bash
 .venv/bin/python tests/test_ficha_roll.py      # ou: .venv/bin/python -m pytest tests/ (se tiveres pytest)
 .venv/bin/python tests/test_broadcast_files.py # anexos do /webhook/broadcast (define BROADCAST_ALLOW_LOCAL_HTTP=1 sozinho)
+python3 tests/test_som.py                      # motor de som (precisa de numpy)
+python3 tests/test_visita.py                   # visitas agendadas: horários, som em uso, reinícios, avisos, rotas
 ```
 
 ### Estrutura do `bot.py`

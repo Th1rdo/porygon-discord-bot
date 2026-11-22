@@ -358,6 +358,31 @@ class Mixer:
     def nudge(self, bus: str, step_db: float) -> dict:
         return self.set_volume(bus, self.bus_db.get(bus, 0.0) + step_db)
 
+    def active_cues(self) -> set[str]:
+        with self.lock:
+            return {v.cue for v in self._voices()}
+
+    def drop(self, cue_id: str) -> None:
+        """Tira já (sem fade) as vozes de uma deixa. Só para quando o leitor está parado."""
+        with self.lock:
+            for v in self._voices():
+                if v.cue == cue_id:
+                    v.finished = True
+            self.music_out = [v for v in self.music_out if not v.finished]
+            self.tapes_out = [v for v in self.tapes_out if not v.finished]
+            self.sfx = [v for v in self.sfx if not v.finished]
+            if self.music is not None and self.music.finished:
+                self.music = None
+            if self.tape is not None and self.tape.finished:
+                self.tape = None
+
+    def reset(self) -> None:
+        """Esvazia todas as vozes (os volumes ficam). Só para quando o leitor está parado."""
+        with self.lock:
+            self.music, self.tape = None, None
+            self.music_out, self.tapes_out, self.sfx = [], [], []
+            self.duck = Env(1.0)
+
     def _voices(self) -> list[Voice]:
         vs = [v for v in [self.music, self.tape] if v is not None] + self.music_out + self.tapes_out + self.sfx
         return [v for v in vs if not v.finished]
@@ -496,6 +521,9 @@ class Station:
       POST /som/cmd          {"action": play|stop|break|next|fade_all|silence|volume|nudge|join|leave, ...}
       PUT  /som/files/{nome} carregar um ficheiro de som (corpo cru)
       PUT  /som/cues         substituir a lista de deixas (JSON)
+      GET  /som/visita       configuração e estado da visita agendada (visita.py)
+      PUT  /som/visita       validar e substituir a configuração da visita
+      POST /som/visita/agora {"minutes": n}: visita de teste já, por n minutos (1-30)
     """
 
     def __init__(self, bot, root: Path, token: str | None):
@@ -515,6 +543,8 @@ class Station:
         self.loading = False
         self.last_error = None
         self.html = (Path(__file__).parent / "som_deck.html").read_text(encoding="utf-8")
+        from visita import Visita
+        self.visita = Visita(self)
 
     # -- configuração persistente (canal escolhido, volumes)
     def _save_cfg(self):
@@ -552,6 +582,19 @@ class Station:
         if vc is not None and vc.is_connected() and not vc.is_playing():
             vc.play(self.Source(self.mixer), after=lambda e: e and log.error("som: o leitor parou: %s", e))
             log.info("som: a tocar no canal %s", vc.channel)
+
+    def busy(self) -> str | None:
+        """Porque é que o som está em uso (já num canal), ou None se está livre."""
+        if self.cfg.get("channel"):
+            return f"já está no canal {self.cfg['channel']}"
+        for vc in getattr(self.bot, "voice_clients", None) or []:
+            if vc.is_connected():
+                return f"ligado a {vc.channel}"
+        return None
+
+    async def play_cue(self, cue_id: str):
+        import asyncio
+        return await asyncio.get_running_loop().run_in_executor(None, self.mixer.play, cue_id, None)
 
     async def leave(self):
         vc = self._vc()
@@ -685,7 +728,39 @@ class Station:
             __import__("asyncio").get_running_loop().create_task(self.preload())
             return web.json_response({"ok": True, "cues": len(cues)})
 
+        async def visita_get(request):
+            if not self._authorized(request):
+                return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+            return web.json_response({"ok": True, **self.visita.describe()})
+
+        async def visita_put(request):
+            if not self._authorized(request):
+                return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+            try:
+                d = await request.json()
+            except Exception:
+                return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+            errs = self.visita.set_config(d)
+            if errs:
+                return web.json_response({"ok": False, "error": "invalid", "detail": errs}, status=400)
+            return web.json_response({"ok": True, **self.visita.describe()})
+
+        async def visita_now(request):
+            if not self._authorized(request):
+                return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+            try:
+                d = await request.json()
+            except Exception:
+                return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+            r = await self.visita.start_now(d.get("minutes") if isinstance(d, dict) else None)
+            if r:
+                return web.json_response({"ok": False, "error": r[1], "detail": r[2]}, status=r[0])
+            return web.json_response({"ok": True, **self.visita.describe()})
+
         return [
+            web.get("/som/visita", visita_get),
+            web.put("/som/visita", visita_put),
+            web.post("/som/visita/agora", visita_now),
             web.get("/som", page),
             web.get("/som/state", state),
             web.post("/som/cmd", cmd),
