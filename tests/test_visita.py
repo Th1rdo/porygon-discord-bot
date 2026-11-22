@@ -19,6 +19,7 @@ CUES = {
     "room": {"kind": "sfx", "file": "room", "loop": True},
     "song": {"kind": "music", "file": "song"},
     "once": {"kind": "sfx", "file": "once"},  # sem loop
+    "room_r": {"kind": "sfx", "file": "room_r", "loop": True},  # a mesma sala, sem o momento único
 }
 CONF = {"enabled": True, "channel_id": "111", "start": "22:30", "leave_between": ["22:45", "23:00"],
         "tz": "Europe/Lisbon", "cue": "room"}
@@ -356,6 +357,34 @@ def test_restart_mid_visit_resumes_until_leave_time():
     assert st2.joins == []  # o mesmo dia não volta a ter visita
 
 
+def _restart_mid_visit(conf_extra):
+    st = FakeStation({"visita": {**CONF, **conf_extra}})
+    v, st, clock = make(ts(2026, 5, 4, 22, 30, 1), st)
+    run(v.tick())
+    first = list(st.played)
+    st2 = FakeStation(copy.deepcopy(st.cfg))
+    v2, st2, clock2 = make(ts(2026, 5, 4, 22, 40), st2)
+    run(v2.tick())
+    clock2.t += 20
+    run(v2.tick())  # já está a tocar: nada de novo, nem conta como "pegar no som"
+    return first, st2, v2
+
+
+def test_restart_resume_plays_cue_resume_when_set():
+    first, st2, v2 = _restart_mid_visit({"cue_resume": "room_r"})
+    assert first == ["room"] and st2.played == ["room_r"] and v2.visit is not None
+    assert v2.describe()["state"]["cue_resume"] == "room_r"
+    clock_leave = v2.visit["leave_at"] + 1
+    v2.now = lambda: clock_leave
+    run(v2.tick())
+    assert st2.leaves == 1 and st2.mixer.active_cues() == set()
+
+
+def test_restart_resume_without_cue_resume_plays_cue():
+    first, st2, v2 = _restart_mid_visit({})
+    assert first == ["room"] and st2.played == ["room"] and v2.visit is not None
+
+
 def test_restart_after_leave_time_leaves_at_once():
     v, st, clock = make(ts(2026, 5, 4, 22, 30, 1))
     run(v.tick())
@@ -412,7 +441,9 @@ def test_start_now_refuses_when_busy_or_bad_minutes():
 def test_validate_config():
     c, e = visita.validate_config({"channel_id": 123, "cue": "room"}, CUES)
     assert not e and c["channel_id"] == "123" and c["enabled"] is False and c["tz"] == "Europe/Lisbon"
-    assert c["days"] is None and c["leave_between"] == ["22:45", "23:00"]
+    assert c["days"] is None and c["leave_between"] == ["22:45", "23:00"] and c["cue_resume"] is None
+    c, e = visita.validate_config({"channel_id": 1, "cue": "room", "cue_resume": "room_r"}, CUES)
+    assert not e and c["cue_resume"] == "room_r"
     bad = [
         {"enabled": True},  # sem canal nem deixa
         {"cue": "nope"},
@@ -424,6 +455,7 @@ def test_validate_config():
         {"days": ["funday"]},
         {"enabled": "yes"},
         {"color": "blue"},
+        {"cue_resume": "nope"},
     ]
     for b in bad:
         assert visita.validate_config(b, CUES)[1], b
@@ -499,7 +531,7 @@ def test_routes_auth_get_put_and_now():
             sys.modules["discord"] = types.SimpleNamespace(AudioSource=object)
     root = Path(tempfile.mkdtemp(prefix="visita-test-"))
     (root / "files").mkdir()
-    for f in ("room", "song", "once"):
+    for f in ("room", "song", "once", "room_r"):
         (root / "files" / f).write_bytes(b"x")
     (root / "cues.json").write_text(json.dumps(CUES))
     st = som.Station(SimpleNamespace(voice_clients=[]), root, "tok")
@@ -521,6 +553,9 @@ def test_routes_auth_get_put_and_now():
             assert (await c.get("/som/visita", headers={"Authorization": "Bearer nope"})).status == 401
             r = await (await c.get("/som/visita", headers=H)).json()
             assert r["ok"] and r["config"]["enabled"] is False and r["state"]["in_visit"] is False
+            assert "cue_resume" in r["config"]
+            r = await c.put("/som/visita", headers=H, json={"cue_resume": "nope"})
+            assert r.status == 400
             r = await c.put("/som/visita", headers=H, json={"enabled": True, "cue": "room"})
             assert r.status == 400 and (await r.json())["error"] == "invalid"
             r = await c.post("/som/visita/agora", headers=H, json={"minutes": 3})

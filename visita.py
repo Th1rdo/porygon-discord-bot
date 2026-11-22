@@ -40,6 +40,7 @@ DEFAULTS = {
     "leave_between": ["22:45", "23:00"],
     "tz": "Europe/Lisbon",
     "cue": None,
+    "cue_resume": None,  # deixa a tocar quando a visita retoma (reinício a meio); None = a mesma `cue`
     "days": None,  # None = todos; senão lista de 0..6 (segunda = 0)
 }
 DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -111,8 +112,9 @@ def validate_config(d, cues: dict) -> tuple[dict | None, list[str]]:
             raise ValueError("tem de ser start < leave_between[0] <= leave_between[1], no mesmo dia")
     except ValueError as e:
         errs.append(str(e))
-    if c["cue"] is not None and c["cue"] not in cues:
-        errs.append(f"deixa desconhecida: {c['cue']!r}")
+    for k in ("cue", "cue_resume"):
+        if c[k] is not None and c[k] not in cues:
+            errs.append(f"deixa desconhecida em {k}: {c[k]!r}")
     if c["days"] is not None:
         days = c["days"] if isinstance(c["days"], list) else [c["days"]]
         norm = set()
@@ -243,8 +245,9 @@ class Visita:
         self.st.mixer.reset()
         if day:
             s["last_date"], s["last_outcome"] = day, "visited"
-        s["visit"] = {"channel": str(channel), "cue": cue, "started_at": self.now(), "leave_at": leave_at,
-                      "test": test, "notified": []}
+        s["visit"] = {"channel": str(channel), "cue": cue, "cue_resume": self.conf.get("cue_resume") or cue,
+                      "started_at": self.now(), "leave_at": leave_at, "test": test, "notified": [],
+                      "played": False}
         self._save()  # antes de entrar: se o processo morrer aqui, o dia já está gasto
         self._ours = False
         try:
@@ -266,11 +269,15 @@ class Visita:
         c = self.st.mixer.cues.get(cue, {})
         return bool(c.get("loop")) or any(x.get("loop") for x in c.get("sections") or [])
 
+    @staticmethod
+    def _cues_of(v: dict) -> set[str]:
+        return {v["cue"], v.get("cue_resume") or v["cue"]}
+
     def _taken_over(self, v: dict) -> str | None:
         ch = self.st.cfg.get("channel")
         if ch != v["channel"]:
             return "moved" if ch else "left"
-        others = self.st.mixer.active_cues() - {v["cue"]}
+        others = self.st.mixer.active_cues() - self._cues_of(v)
         if others:
             return "played " + ",".join(sorted(others))
         return None
@@ -289,28 +296,34 @@ class Visita:
         (stop/silence/fade_all numa deixa com loop), fica calada, mas a visita sai à hora na mesma."""
         if v.get("silenced"):
             return
-        if v["cue"] in self.st.mixer.active_cues():
+        if self._cues_of(v) & self.st.mixer.active_cues():
             return
-        if self._ours and self._cue_loops(v["cue"]):
+        if self._ours and self._cue_loops(v.get("playing") or v["cue"]):
             v["silenced"] = True
             self._save()
             log.info("visita: a deixa foi calada à mão; fica em silêncio até à hora de saída")
             return
         if getattr(self.st, "loading", False):  # a Station ainda está a descodificar tudo: fica para o próximo tick
             return
+        # a primeira vez toca `cue`; depois (reinício a meio, ou deixa sem loop que acabou) toca `cue_resume`,
+        # para que um momento único dentro da deixa não se repita na mesma visita
+        cue = (v.get("cue_resume") or v["cue"]) if v.get("played", True) else v["cue"]
         try:
-            await self.st.play_cue(v["cue"])
+            await self.st.play_cue(cue)
             self._ours = True
+            v["played"], v["playing"] = True, cue
+            self._save()
         except KeyError:
-            log.warning("visita: a deixa %s já não existe", v["cue"])
+            log.warning("visita: a deixa %s já não existe", cue)
             await self._leave(v, "cue_missing")
 
     def _end_quietly(self, v: dict, why: str):
         m = self.st.mixer
-        if self.st.cfg.get("channel"):
-            m.stop(v["cue"], self.TAKEOVER_FADE)  # só a deixa da visita; o resto é de quem pegou no som
-        else:
-            m.drop(v["cue"])  # sem canal o mixer não anda: tirar já, senão volta no próximo "entrar"
+        for c in self._cues_of(v):
+            if self.st.cfg.get("channel"):
+                m.stop(c, self.TAKEOVER_FADE)  # só a deixa da visita; o resto é de quem pegou no som
+            else:
+                m.drop(c)  # sem canal o mixer não anda: tirar já, senão volta no próximo "entrar"
         log.info("visita: acabou porque alguém pegou no som (%s)", why)
         self._finish("takeover: " + why, v)
 
@@ -324,7 +337,8 @@ class Visita:
             log.info("visita: alguém pegou no som durante a saída (%s)", why)
             return self._finish("takeover: " + why, v)
         await self.st.leave()
-        self.st.mixer.drop(v["cue"])
+        for c in self._cues_of(v):
+            self.st.mixer.drop(c)
         log.info("visita: saiu (%s)", outcome)
         self._finish(outcome, v)
 
@@ -399,7 +413,8 @@ class Visita:
         except Exception as e:
             out["error"] = str(e)
         if v:
-            out.update({"channel": v["channel"], "cue": v["cue"], "test": v["test"],
+            out.update({"channel": v["channel"], "cue": v["cue"], "cue_resume": v.get("cue_resume") or v["cue"],
+                        "test": v["test"],
                         "started_at": _iso(v["started_at"], c["tz"]), "leave_at": _iso(v["leave_at"], c["tz"]),
                         "listeners": len(v["notified"])})
         return {"config": c, "state": out}

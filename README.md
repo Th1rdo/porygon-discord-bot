@@ -316,6 +316,7 @@ hora sorteada dentro de uma janela. Não escreve nada nem muda o estado do bot. 
 | `enabled` | `false` | Liga o agendamento (a visita de teste funciona mesmo desligado) |
 | `channel_id` | — | Canal de voz (obrigatório para ligar) |
 | `cue` | — | Id de uma deixa em `cues.json` (obrigatório para ligar). Convém `"loop": true` |
+| `cue_resume` | = `cue` | Deixa tocada quando a visita retoma depois de um reinício a meio (ex.: a mesma deixa sem um momento único, para não o repetir) |
 | `start` | `"22:30"` | Hora de entrada, no fuso `tz` (com hora de verão) |
 | `leave_between` | `["22:45","23:00"]` | Janela da saída; tem de ser `start < início <= fim`, no mesmo dia |
 | `tz` | `"Europe/Lisbon"` | Fuso IANA |
