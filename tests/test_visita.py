@@ -237,13 +237,65 @@ def test_takeover_by_leave_drops_visit_voice():
     assert st.mixer.active_cues() == set()  # não volta a soar no próximo "entrar"
 
 
-def test_manual_stop_of_looping_cue_counts_as_takeover():
+def test_manual_stop_of_looping_cue_is_not_replayed_but_visit_still_leaves():
     v, st, clock = make(ts(2026, 5, 4, 22, 30, 1))
     run(v.tick())
     st.mixer.reset()  # como se o "silêncio" tivesse acabado de esvaziar o mixer
     clock.t += 20
     run(v.tick())
-    assert v.visit is None and st.played == ["room"]
+    clock.t += 20
+    run(v.tick())
+    assert v.visit is not None and v.visit["silenced"] and st.played == ["room"]  # não volta a tocar
+    clock.t = v.visit["leave_at"] + 1
+    run(v.tick())
+    assert st.leaves == 1 and "channel" not in st.cfg and v.visit is None
+    assert v.state["last_end"]["outcome"] == "done"
+    clock.t = ts(2026, 5, 5, 22, 30, 5)  # e na noite seguinte o som não está "em uso"
+    run(v.tick())
+    assert st.joins == [111, 111]
+
+
+def test_silenced_cue_stays_silent_after_restart():
+    v, st, clock = make(ts(2026, 5, 4, 22, 30, 1))
+    run(v.tick())
+    st.mixer.reset()
+    clock.t += 20
+    run(v.tick())
+    st2 = FakeStation(copy.deepcopy(st.cfg))
+    v2, st2, clock2 = make(clock.t + 20, st2)
+    run(v2.tick())
+    assert st2.played == [] and v2.visit is not None
+    clock2.t = v2.visit["leave_at"] + 1
+    run(v2.tick())
+    assert st2.leaves == 1 and "channel" not in st2.cfg
+
+
+def test_leave_during_fade_window_ends_quietly():
+    v, st, clock = make(ts(2026, 5, 4, 22, 30, 1))
+    run(v.tick())
+
+    async def tiago_leaves(_):
+        st.cfg.pop("channel", None)  # "sair" pelo telemóvel durante o fade
+
+    v.sleep = tiago_leaves
+    clock.t = v.visit["leave_at"] + 1
+    run(v.tick())
+    assert st.leaves == 0 and "channel" not in st.cfg and v.visit is None
+    assert v.state["last_end"]["outcome"] == "takeover: left"
+
+
+def test_join_elsewhere_during_fade_window_keeps_new_channel():
+    v, st, clock = make(ts(2026, 5, 4, 22, 30, 1))
+    run(v.tick())
+
+    async def tiago_joins(_):
+        st.cfg["channel"] = "222"
+
+    v.sleep = tiago_joins
+    clock.t = v.visit["leave_at"] + 1
+    run(v.tick())
+    assert st.leaves == 0 and st.cfg["channel"] == "222" and v.visit is None
+    assert v.state["last_end"]["outcome"] == "takeover: moved"
 
 
 def test_resume_waits_while_station_is_loading():

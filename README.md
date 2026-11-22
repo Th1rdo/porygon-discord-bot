@@ -326,9 +326,11 @@ Comportamento (um tick a cada ~20 s):
 - **Som em uso → o dia é saltado.** Se à hora de entrada a Station já estiver num canal (uma sessão), não há visita
   nesse dia (`last_outcome: "busy"` e uma linha no log). Se o bot só ficar pronto depois do início da janela de saída,
   o dia fica `"missed"`. Um dia nunca tem duas visitas.
-- **Alguém pega no som → a visita acaba em silêncio.** Entrar noutro canal, tocar outra deixa, `leave` ou parar a deixa
-  da visita: a visita deixa de mandar. Não sai do canal, não mexe em volumes nem no que foi posto a tocar; só a deixa
-  da visita é retirada (fade de 3 s), para não ficar a tocar por baixo.
+- **Alguém pega no som → a visita acaba em silêncio.** Entrar noutro canal, tocar outra deixa ou `leave` (também
+  durante o fade de saída): a visita deixa de mandar. Não sai do canal, não mexe em volumes nem no que foi posto a
+  tocar; só a deixa da visita é retirada (fade de 3 s), para não ficar a tocar por baixo.
+- **Calar a deixa não é pegar no som.** `stop`/`silence`/`fade_all` na deixa da visita: ela não volta a tocar (nem
+  depois de um reinício), mas a visita sai do canal à hora marcada como sempre.
 - **Reinícios.** O estado vive em `config.json` → `"visita_state"`. Se o bot reiniciar a meio, o watchdog volta ao
   canal e a visita retoma a deixa até à hora de saída; se já passou da hora, sai logo.
 - **Quem entra.** Se `VISITA_NOTIFY_WEBHOOK` (URL de um webhook do Discord) estiver definida, cada pessoa (não bots)

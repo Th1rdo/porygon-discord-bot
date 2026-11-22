@@ -9,9 +9,10 @@ Regras:
   canal o som está em uso (uma sessão): o dia é saltado e fica registado porquê. Senão entra em
   `channel_id`, toca `cue` e sorteia a hora de saída dentro de `leave_between`.
 - À hora de saída: `fade_all` e sai.
-- Se alguém pegar no som durante a visita (entrar noutro canal, tocar outra deixa, sair, parar a
-  deixa), a visita acaba em silêncio: não sai do canal, não mexe em volumes nem no que está a tocar.
-  Só a própria deixa da visita é retirada, para não ficar a tocar por baixo de quem pegou no som.
+- Se alguém pegar no som durante a visita (entrar noutro canal, tocar outra deixa, sair), a visita
+  acaba em silêncio: não sai do canal, não mexe em volumes nem no que está a tocar. Só a própria
+  deixa da visita é retirada, para não ficar a tocar por baixo de quem pegou no som.
+- Parar/calar a deixa da visita não é pegar no som: a deixa não volta, mas a visita sai à hora.
 - Um dia nunca tem duas visitas. Se o bot reiniciar a meio, retoma até à hora de saída.
 - Quem entrar no canal durante a visita gera um aviso (uma vez por pessoa e visita) no webhook do
   Discord em `VISITA_NOTIFY_WEBHOOK`, se existir.
@@ -272,8 +273,6 @@ class Visita:
         others = self.st.mixer.active_cues() - {v["cue"]}
         if others:
             return "played " + ",".join(sorted(others))
-        if self._ours and v["cue"] not in self.st.mixer.active_cues() and self._cue_loops(v["cue"]):
-            return "stopped"
         return None
 
     async def _tick_visit(self, now: float):
@@ -286,8 +285,16 @@ class Visita:
         await self._ensure_cue(v)
 
     async def _ensure_cue(self, v: dict):
-        """Reinício (mixer novo) ou deixa sem loop que acabou: volta a tocar."""
+        """Reinício (mixer novo) ou deixa sem loop que acabou: volta a tocar. Se alguém a calou
+        (stop/silence/fade_all numa deixa com loop), fica calada, mas a visita sai à hora na mesma."""
+        if v.get("silenced"):
+            return
         if v["cue"] in self.st.mixer.active_cues():
+            return
+        if self._ours and self._cue_loops(v["cue"]):
+            v["silenced"] = True
+            self._save()
+            log.info("visita: a deixa foi calada à mão; fica em silêncio até à hora de saída")
             return
         if getattr(self.st, "loading", False):  # a Station ainda está a descodificar tudo: fica para o próximo tick
             return
@@ -313,7 +320,7 @@ class Visita:
             self.st.mixer.fade_all(self.LEAVE_FADE)
             await self.sleep(self.LEAVE_FADE + 0.5)
         why = self._taken_over(v) if outcome == "done" else None
-        if why and why != "stopped":  # alguém pegou no som durante o fade: fica com ele
+        if why:  # alguém pegou no som durante o fade (entrou noutro canal, saiu, tocou outra deixa): fica com ele
             log.info("visita: alguém pegou no som durante a saída (%s)", why)
             return self._finish("takeover: " + why, v)
         await self.st.leave()
