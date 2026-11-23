@@ -891,7 +891,7 @@ def _is_manager(member) -> bool:
     return bool(perms and (perms.manage_guild or perms.administrator))
 
 def _render_config(guild_id: int) -> str:
-    lines = ["⚙️ **Config do Porygon neste servidor**", ""]
+    lines = ["⚙️ **Config do Ajudante neste servidor**", ""]
     for feat in FEATURES:
         estado = "✅ ativada" if feature_enabled(guild_id, feat) else "🚫 desativada"
         lines.append(f"• `{feat}` — {estado}")
@@ -901,7 +901,7 @@ def _render_config(guild_id: int) -> str:
         "• `!config disable roll` — desligar uma função",
         "• `!config enable roll` — voltar a ligar",
         f"\nFunções: {', '.join(f'`{f}`' for f in FEATURES)}.",
-        "Quando uma função está desligada, o Porygon ignora-a por completo "
+        "Quando uma função está desligada, o Ajudante ignora-a por completo "
         "(útil se tiveres outro bot com o mesmo prefixo `!`).",
     ]
     return "\n".join(lines)
@@ -934,7 +934,7 @@ async def config_cmd(ctx, action: str | None = None, feature: str | None = None)
     estado = "ativada ✅" if action == "enable" else "desativada 🚫"
     await ctx.send(f"`{feat}` {estado} neste servidor.")
 
-@bot.tree.command(name="config", description="Ligar/desligar funções do Porygon neste servidor (só admins)")
+@bot.tree.command(name="config", description="Ligar/desligar funções do Ajudante neste servidor (só admins)")
 async def config_slash(interaction: discord.Interaction, action: str | None = None, feature: str | None = None):
     if interaction.guild_id is None:
         await interaction.response.send_message("O config só funciona dentro de um servidor.", ephemeral=True)
@@ -2739,7 +2739,7 @@ async def manual_cmd(ctx):
     else:
         await ctx.send("Não consegui enviar DM — verifica se tens DMs abertas para membros deste servidor.")
 
-@bot.tree.command(name="manual", description="Receber o manual do Porygon por DM")
+@bot.tree.command(name="manual", description="Receber o manual do Ajudante por DM")
 async def manual_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     ok = await _send_manual(interaction.user)
