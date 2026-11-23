@@ -2592,6 +2592,54 @@ async def ficha_canal_padrao_slash(interaction: discord.Interaction,
     await interaction.response.send_message(
         f"✅ Rolagens de quem não escolheu canal vão para {channel.mention}.", ephemeral=True)
 
+# ---- /consulta: comando reencaminhado para um serviço HTTP (consulta.py) ------
+# Com CONSULTA_URL e CONSULTA_TOKEN definidas, /consulta pedido:<texto> faz POST ao serviço e mostra a resposta
+# (texto e, opcionalmente, um botão com link) só a quem pediu. Sem as duas, o comando não é registado.
+import consulta as _consulta
+
+CONSULTA = _consulta.config_from_env()
+_consulta_limiter = SlidingWindowLimiter(*_consulta.RATE)
+
+
+def _consulta_view(link: dict | None):
+    if not link:
+        return None
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label=link["label"], url=link["url"]))
+    return view
+
+
+@app_commands.describe(pedido=_consulta.TEXT["option"])
+async def consulta_slash(interaction: discord.Interaction, pedido: str):
+    none = discord.AllowedMentions.none()
+    if CONSULTA is None:  # não registado nesse caso; defesa se for chamado à mão
+        await interaction.response.send_message(_consulta.TEXT["unavailable"], ephemeral=True, allowed_mentions=none)
+        return
+    if _consulta_limiter.hit(str(interaction.user.id)):
+        await interaction.response.send_message(_consulta.TEXT["rate_limited"], ephemeral=True, allowed_mentions=none)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    url, token = CONSULTA
+    payload = _consulta.build_payload(interaction.user.id, getattr(interaction.user, "display_name", None),
+                                      interaction.guild_id, interaction.channel_id, pedido)
+    try:
+        content, link = await _consulta.forward(url, token, payload)
+    except Exception as e:  # rede, timeout, status, JSON: tudo dá a mesma resposta neutra
+        logging.warning("consulta: falhou para %s: %s: %s", interaction.user.id, type(e).__name__, e)
+        await interaction.followup.send(_consulta.TEXT["unavailable"], ephemeral=True, allowed_mentions=none)
+        return
+    kw = {"ephemeral": True, "allowed_mentions": none}
+    view = _consulta_view(link)
+    if view is not None:
+        kw["view"] = view
+    await interaction.followup.send(content, **kw)
+
+
+if CONSULTA is not None:
+    bot.tree.add_command(app_commands.Command(name=_consulta.TEXT["name"], description=_consulta.TEXT["description"],
+                                              callback=consulta_slash))
+    logging.info("consulta: /consulta ligado")
+
 # ---- ajuda / manual ---------------------------------------------------------
 # Compact Avrae-style command reference, grouped by category.
 AJUDA_TEXT = """# 📖 Manual do Bot

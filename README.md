@@ -21,6 +21,7 @@ Bot de Discord para as campanhas de TTRPG — dados, missões, countdowns e agen
    - [🎲 Rolagens da ficha → Discord](#-rolagens-da-ficha--discord)
    - [⚙️ Config por servidor](#️-config-por-servidor)
    - [🔊 Som (canal de voz) e visitas agendadas](#-som-canal-de-voz-e-visitas-agendadas)
+   - [🔎 Consulta (comando reencaminhado)](#-consulta-comando-reencaminhado)
    - [🌐 Webhook HTTP](#-webhook-http)
 2. [Persistência de dados](#persistência-de-dados)
 3. [Hosting e deploy (Railway)](#hosting-e-deploy-railway)
@@ -339,6 +340,28 @@ Comportamento (um tick a cada ~20 s):
   `👂 <nome> entrou em <canal> durante a visita (hh:mm)`, com menções desligadas e markdown escapado.
   Usa o intent `voice_states` (vem em `Intents.default()`).
 
+### 🔎 Consulta (comando reencaminhado)
+
+`/consulta pedido:<texto>` passa o pedido a um serviço HTTP externo e mostra a resposta **só a quem pediu**
+(efémera). O bot não sabe nada dos pedidos: quem responde é o serviço (`consulta.py`).
+
+| Env var | |
+|---|---|
+| `CONSULTA_URL` | Endpoint do serviço (`https://…`) |
+| `CONSULTA_TOKEN` | Segredo partilhado, enviado em `Authorization: Bearer …` |
+
+Sem **as duas** o comando não é registado (não aparece no Discord).
+
+- **Pedido:** `POST CONSULTA_URL` com `{"user_id", "display_name", "guild_id", "channel_id", "pedido"}` (ids como
+  texto; `guild_id` é `null` em DM), timeout 8 s, sem seguir redirects.
+- **Resposta esperada:** `200` com `{"content": "…", "link"?: {"label": "…", "url": "https://…"}}`. `content` tem
+  1–2000 chars; o `link` (label ≤80) aparece como botão de link. Menções desligadas.
+- **Erros** (rede, timeout, status ≠ 200, JSON inválido): quem pediu vê "Serviço indisponível. Tente mais tarde." e
+  o motivo fica no log (sem o token).
+- **Limite:** 5 consultas por minuto por pessoa.
+
+Testes: `python tests/test_consulta.py` (serviço aiohttp local e interação falsa, sem Discord).
+
 ### 🌐 Webhook HTTP
 
 Servidor aiohttp na porta `PORT` (default 8080) para disparar rolls de fora do Discord.
@@ -394,6 +417,7 @@ Se `DATA_DIR` não for gravável (dev local, ou volume mal montado), o bot avisa
 | `BROADCAST_FILE_HOSTS` | — | Hosts (separados por vírgulas) de onde o `/webhook/broadcast` pode descarregar anexos. Vazio = qualquer host `https` |
 | `SOM_TOKEN` | — | Protege as rotas `/som/*` (sem ela usa `WEBHOOK_TOKEN`) |
 | `VISITA_NOTIFY_WEBHOOK` | — | Webhook do Discord para os avisos de quem entra durante uma visita (vazio = sem avisos) |
+| `CONSULTA_URL` / `CONSULTA_TOKEN` | — | Serviço e segredo do `/consulta` (sem as duas o comando não existe) |
 | `BROADCAST_ALLOW_LOCAL_HTTP` | — | `1` aceita anexos em `http://localhost` / `127.0.0.1` (só dev e testes; nunca em produção) |
 
 **Fluxo normal de trabalho:** editar `bot.py` → commit → `git push` → o Railway faz build e redeploy sozinho (1–2 min). Os slash commands sincronizam no arranque (`on_ready`); comandos novos podem demorar uns minutos a aparecer no Discord.
@@ -420,6 +444,7 @@ não tocam em nada real). Importar `bot.py` não arranca o bot (`bot.run` está 
 ```bash
 .venv/bin/python tests/test_ficha_roll.py      # ou: .venv/bin/python -m pytest tests/ (se tiveres pytest)
 .venv/bin/python tests/test_broadcast_files.py # anexos do /webhook/broadcast (define BROADCAST_ALLOW_LOCAL_HTTP=1 sozinho)
+.venv/bin/python tests/test_consulta.py        # /consulta (serviço local e interação falsa)
 python3 tests/test_som.py                      # motor de som (precisa de numpy)
 python3 tests/test_visita.py                   # visitas agendadas: horários, som em uso, reinícios, avisos, rotas
 ```
