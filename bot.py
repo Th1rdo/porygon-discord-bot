@@ -2629,10 +2629,14 @@ async def consulta_slash(interaction: discord.Interaction, pedido: str):
         await interaction.followup.send(_consulta.TEXT["unavailable"], ephemeral=True, allowed_mentions=none)
         return
     kw = {"ephemeral": True, "allowed_mentions": none}
-    view = _consulta_view(link)
-    if view is not None:
-        kw["view"] = view
-    await interaction.followup.send(content, **kw)
+    try:
+        view = _consulta_view(link)
+        if view is not None:
+            kw["view"] = view
+        await interaction.followup.send(content, **kw)
+    except Exception as e:  # o Discord recusou a resposta (ex.: botão inválido): a mesma mensagem neutra
+        logging.warning("consulta: resposta recusada para %s: %s: %s", interaction.user.id, type(e).__name__, e)
+        await interaction.followup.send(_consulta.TEXT["unavailable"], ephemeral=True, allowed_mentions=none)
 
 
 if CONSULTA is not None:

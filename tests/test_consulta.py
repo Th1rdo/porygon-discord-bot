@@ -9,7 +9,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="porygon-test-")
-os.environ["CONSULTA_URL"] = "http://127.0.0.1:1/placeholder"  # trocado pelo servidor de teste em cada teste
+os.environ["CONSULTA_URL"] = "https://consulta.test/c"  # o comando usa o servidor de teste local em cada teste
 os.environ["CONSULTA_TOKEN"] = "tok-test"
 sys.path.insert(0, ROOT)
 
@@ -22,7 +22,7 @@ from aiohttp.test_utils import TestServer  # noqa: E402
 
 # ---- fakes -------------------------------------------------------------------
 class FakeUser:
-    def __init__(self, uid=111, name="Leitora"):
+    def __init__(self, uid=111, name="Teste"):
         self.id, self.display_name = uid, name
 
 
@@ -46,7 +46,7 @@ class FakeFollowup:
 
 
 class FakeInteraction:
-    def __init__(self, uid=111, name="Leitora", guild_id=222, channel_id=333):
+    def __init__(self, uid=111, name="Teste", guild_id=222, channel_id=333):
         self.log = []
         self.user = FakeUser(uid, name)
         self.guild_id, self.channel_id = guild_id, channel_id
@@ -98,6 +98,8 @@ def test_config_from_env_needs_both():
     assert C.config_from_env({"CONSULTA_URL": "https://x/y"}) is None
     assert C.config_from_env({"CONSULTA_TOKEN": "t"}) is None
     assert C.config_from_env({"CONSULTA_URL": "ftp://x", "CONSULTA_TOKEN": "t"}) is None
+    assert C.config_from_env({"CONSULTA_URL": "http://x/y", "CONSULTA_TOKEN": "t"}) is None  # só https
+    assert C.config_from_env({"CONSULTA_URL": "https:///y", "CONSULTA_TOKEN": "t"}) is None
     assert C.config_from_env({"CONSULTA_URL": " https://x/y ", "CONSULTA_TOKEN": "t"}) == ("https://x/y", "t")
 
 
@@ -115,7 +117,8 @@ def test_parse_reply_valid_and_invalid():
            {"content": "a", "link": "https://e"}, {"content": "a", "link": {"label": "", "url": "https://e"}},
            {"content": "a", "link": {"label": "L" * 81, "url": "https://e"}},
            {"content": "a", "link": {"label": "L", "url": "javascript:alert(1)"}},
-           {"content": "a", "link": {"label": "L"}}]
+           {"content": "a", "link": {"label": "L"}},
+           {"content": "a", "link": {"label": "L", "url": "http://e/x"}}]
     for b in bad:
         try:
             C.parse_reply(b)
@@ -123,6 +126,15 @@ def test_parse_reply_valid_and_invalid():
             continue
         raise AssertionError(f"devia falhar: {b!r}")
     assert C.parse_reply({"content": "x" * 2000})[0] == "x" * 2000
+    # com host: só links desse host
+    ok = {"content": "a", "link": {"label": "L", "url": "https://Servico.Example/x"}}
+    assert C.parse_reply(ok, host="servico.example")[1]["url"] == "https://Servico.Example/x"
+    for url in ("https://outro.example/x", "https://servico.example.evil/x", "https://evil@outro.example/"):
+        try:
+            C.parse_reply({"content": "a", "link": {"label": "L", "url": url}}, host="servico.example")
+        except C.ConsultaError:
+            continue
+        raise AssertionError(url)
 
 
 # ---- comando --------------------------------------------------------------------
@@ -152,7 +164,8 @@ def test_not_registered_without_env():
 
 def test_forwards_payload_and_bearer_and_renders_link_button():
     async def ok(request):
-        return web.json_response({"content": "**Pedido 1** — ok.", "link": {"label": "Abrir", "url": "https://e/x"}})
+        return web.json_response({"content": "**Pedido 1** — ok.",
+                                  "link": {"label": "Abrir", "url": "https://127.0.0.1/x"}})
 
     inter, seen = run_cmd(ok, FakeInteraction(uid=42, name="Ana", guild_id=7, channel_id=8), pedido=" 1234 ")
     assert seen == [{"auth": "Bearer tok-test", "json": {"user_id": "42", "display_name": "Ana", "guild_id": "7",
@@ -165,7 +178,7 @@ def test_forwards_payload_and_bearer_and_renders_link_button():
     assert am.everyone is False and am.users is False and am.roles is False
     (button,) = kw["view"].children
     assert isinstance(button, discord.ui.Button) and button.style == discord.ButtonStyle.link
-    assert button.label == "Abrir" and button.url == "https://e/x"
+    assert button.label == "Abrir" and button.url == "https://127.0.0.1/x"
 
 
 def test_reply_without_link_has_no_view():
@@ -190,15 +203,38 @@ def test_errors_give_neutral_ephemeral_message():
     async def badshape(request):
         return web.json_response({"content": "x" * 3000})
 
+    async def foreign_link(request):
+        return web.json_response({"content": "x", "link": {"label": "L", "url": "https://outro.example/x"}})
+
     async def redirect(request):
         raise web.HTTPFound("https://example.com/")
 
-    for h in (s500, s401, notjson, badshape, redirect):
+    for h in (s500, s401, notjson, badshape, redirect, foreign_link):
         inter, seen = run_cmd(h)
         assert len(seen) == 1
         kind, content, kw = final(inter)
         assert kind == "followup" and content == "Serviço indisponível. Tente mais tarde.", (h.__name__, content)
         assert kw["ephemeral"] is True and "view" not in kw
+
+
+def test_discord_refusing_the_reply_gives_neutral_text():
+    async def ok(request):
+        return web.json_response({"content": "ok", "link": {"label": "L", "url": "https://127.0.0.1/x"}})
+
+    inter = FakeInteraction()
+    calls = []
+
+    async def flaky_send(content=None, **kw):
+        calls.append((content, kw))
+        if len(calls) == 1:
+            raise RuntimeError("400 Bad Request (invalid button)")
+        inter.log.append(("followup", content, kw))
+
+    inter.followup.send = flaky_send
+    run_cmd(ok, inter)
+    assert len(calls) == 2 and calls[0][0] == "ok"
+    kind, content, kw = final(inter)
+    assert content == "Serviço indisponível. Tente mais tarde." and kw["ephemeral"] is True and "view" not in kw
 
 
 def test_unreachable_and_timeout():

@@ -1,10 +1,10 @@
 """Comando /consulta reencaminhado: o bot passa o pedido a um serviço HTTP e mostra a resposta só a quem pediu.
 
-Configuração (env): `CONSULTA_URL` (o endpoint) e `CONSULTA_TOKEN` (segredo partilhado, vai em
+Configuração (env): `CONSULTA_URL` (o endpoint, https) e `CONSULTA_TOKEN` (segredo partilhado, vai em
 `Authorization: Bearer …`). Sem as duas o comando nem é registado.
 
 Pedido:   POST CONSULTA_URL  {"user_id", "display_name", "guild_id", "channel_id", "pedido"}  (timeout 8 s)
-Resposta: 200 {"content": str (1–2000 chars), "link"?: {"label": str (≤80), "url": "https://…"}}
+Resposta: 200 {"content": str (1–2000 chars), "link"?: {"label": str (≤80), "url": "https://<o host de CONSULTA_URL>/…"}}
 O link aparece como botão. Qualquer outra coisa (erro de rede, status ≠ 200, JSON inválido) é um erro: quem
 pediu vê uma mensagem neutra e o motivo vai para o log.
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import urlsplit
 
 log = logging.getLogger("consulta")
 
@@ -42,8 +43,8 @@ def config_from_env(env=os.environ) -> tuple[str, str] | None:
     url = (env.get("CONSULTA_URL") or "").strip()
     token = (env.get("CONSULTA_TOKEN") or "").strip()
     if url and token:
-        if not url.startswith(("https://", "http://")):
-            log.warning("consulta: CONSULTA_URL não é http(s); comando desligado")
+        if not url.startswith("https://") or not urlsplit(url).hostname:
+            log.warning("consulta: CONSULTA_URL tem de ser https://; comando desligado")
             return None
         return url, token
     if url or token:
@@ -61,8 +62,9 @@ def build_payload(user_id, display_name, guild_id, channel_id, pedido) -> dict:
     }
 
 
-def parse_reply(data) -> tuple[str, dict | None]:
-    """Valida o JSON devolvido. Devolve (content, link|None) ou levanta ConsultaError."""
+def parse_reply(data, host: str | None = None) -> tuple[str, dict | None]:
+    """Valida o JSON devolvido. Devolve (content, link|None) ou levanta ConsultaError.
+    O link tem de ser https:// e, com `host`, desse host (o do próprio serviço)."""
     if not isinstance(data, dict):
         raise ConsultaError("resposta não é um objeto JSON")
     content = data.get("content")
@@ -78,8 +80,10 @@ def parse_reply(data) -> tuple[str, dict | None]:
     label, url = link.get("label"), link.get("url")
     if not isinstance(label, str) or not label.strip() or len(label) > LABEL_MAX:
         raise ConsultaError("link.label inválido")
-    if not isinstance(url, str) or not url.startswith(("https://", "http://")) or len(url) > URL_MAX:
+    if not isinstance(url, str) or not url.startswith("https://") or len(url) > URL_MAX:
         raise ConsultaError("link.url inválido")
+    if host is not None and (urlsplit(url).hostname or "").lower() != host.lower():
+        raise ConsultaError("link.url fora do host do serviço")
     return content, {"label": label, "url": url}
 
 
@@ -99,7 +103,7 @@ async def forward(url: str, token: str, payload: dict, timeout: float = TIMEOUT,
                 data = await r.json(content_type=None)
             except ValueError as e:
                 raise ConsultaError("resposta não é JSON") from e
-        return parse_reply(data)
+        return parse_reply(data, host=urlsplit(url).hostname)
     finally:
         if own:
             await session.close()

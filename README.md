@@ -347,7 +347,7 @@ Comportamento (um tick a cada ~20 s):
 
 | Env var | |
 |---|---|
-| `CONSULTA_URL` | Endpoint do serviço (`https://…`) |
+| `CONSULTA_URL` | Endpoint do serviço (tem de ser `https://…`; senão o comando não é registado) |
 | `CONSULTA_TOKEN` | Segredo partilhado, enviado em `Authorization: Bearer …` |
 
 Sem **as duas** o comando não é registado (não aparece no Discord).
@@ -355,7 +355,7 @@ Sem **as duas** o comando não é registado (não aparece no Discord).
 - **Pedido:** `POST CONSULTA_URL` com `{"user_id", "display_name", "guild_id", "channel_id", "pedido"}` (ids como
   texto; `guild_id` é `null` em DM), timeout 8 s, sem seguir redirects.
 - **Resposta esperada:** `200` com `{"content": "…", "link"?: {"label": "…", "url": "https://…"}}`. `content` tem
-  1–2000 chars; o `link` (label ≤80) aparece como botão de link. Menções desligadas.
+  1–2000 chars; o `link` (label ≤80, `https://` no mesmo host de `CONSULTA_URL`) aparece como botão de link. Menções desligadas.
 - **Erros** (rede, timeout, status ≠ 200, JSON inválido): quem pediu vê "Serviço indisponível. Tente mais tarde." e
   o motivo fica no log (sem o token).
 - **Limite:** 5 consultas por minuto por pessoa.
